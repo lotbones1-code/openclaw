@@ -37,6 +37,7 @@ import { normalizeInputProvenance, type InputProvenance } from "../../sessions/i
 import { resolveSendPolicy } from "../../sessions/send-policy.js";
 import { parseAgentSessionKey } from "../../sessions/session-key-utils.js";
 import { emitSessionTranscriptUpdate } from "../../sessions/transcript-events.js";
+import { requestTaskControlStop } from "../../tasks/task-control-registry.js";
 import {
   stripInlineDirectiveTagsForDisplay,
   sanitizeReplyDirectiveId,
@@ -1942,6 +1943,14 @@ export const chatHandlers: GatewayRequestHandlers = {
     }
 
     if (stopCommand) {
+      const control = requestTaskControlStop({
+        command: "stop",
+        scope: `session:${rawSessionKey}`,
+        sessionKey: rawSessionKey,
+        runId: clientRunId,
+        source: "chat.stop-command",
+        reason: "stop-command",
+      });
       const res = abortChatRunsForSessionKeyWithPartials({
         context,
         ops: createChatAbortOps(context),
@@ -1954,7 +1963,7 @@ export const chatHandlers: GatewayRequestHandlers = {
         respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, "unauthorized"));
         return;
       }
-      respond(true, { ok: true, aborted: res.aborted, runIds: res.runIds });
+      respond(true, { ok: true, aborted: res.aborted, runIds: res.runIds, control });
       return;
     }
 

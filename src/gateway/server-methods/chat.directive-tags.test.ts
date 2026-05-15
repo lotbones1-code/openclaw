@@ -3029,11 +3029,17 @@ describe("chat directive tag stripping for non-streaming final payloads", () => 
 
     expect(mockState.savedMediaCalls).toEqual([]);
     expect(mockState.lastDispatchImages).toBeUndefined();
-    expect(respond).toHaveBeenCalledWith(true, {
-      ok: true,
-      aborted: true,
-      runIds: ["run-same-session"],
-    });
+    expect(respond).toHaveBeenCalledWith(
+      true,
+      expect.objectContaining({
+        ok: true,
+        aborted: true,
+        runIds: ["run-same-session"],
+        control: expect.objectContaining({
+          state: "requested",
+        }),
+      }),
+    );
   });
 
   it("emits a user transcript update when chat.send completes without an agent run", async () => {

@@ -3,6 +3,11 @@ import { resolveCronStorePath } from "../cron/store.js";
 import type { RuntimeEnv } from "../runtime.js";
 import { normalizeOptionalString } from "../shared/string-coerce.js";
 import { getTaskById, updateTaskNotifyPolicyById } from "../tasks/runtime-internal.js";
+import {
+  acknowledgeTaskControl,
+  listTaskControlRecords,
+  requestTaskControlStop,
+} from "../tasks/task-control-registry.js";
 import { cancelDetachedTaskRunById } from "../tasks/task-executor.js";
 import {
   listTaskFlowAuditFindings,
@@ -414,6 +419,75 @@ export async function tasksCancelCommand(opts: { lookup: string }, runtime: Runt
   const updated = getTaskById(task.taskId);
   runtime.log(
     `Cancelled ${updated?.taskId ?? task.taskId} (${updated?.runtime ?? task.runtime})${updated?.runId ? ` run ${updated.runId}` : ""}.`,
+  );
+}
+
+export async function tasksControlRequestStopCommand(
+  opts: {
+    scope?: string;
+    taskId?: string;
+    sessionKey?: string;
+    runId?: string;
+    source?: string;
+    reason?: string;
+    json?: boolean;
+  },
+  runtime: RuntimeEnv,
+) {
+  const control = requestTaskControlStop({
+    scope: opts.scope,
+    taskId: opts.taskId,
+    sessionKey: opts.sessionKey,
+    runId: opts.runId,
+    source: opts.source ?? "cli.tasks-control",
+    reason: opts.reason ?? "operator-request",
+  });
+  if (opts.json) {
+    runtime.log(JSON.stringify(control, null, 2));
+    return;
+  }
+  runtime.log(`Requested stop ${control.controlId} scope=${control.scope} state=${control.state}.`);
+}
+
+export async function tasksControlListCommand(
+  opts: { json?: boolean; activeOnly?: boolean },
+  runtime: RuntimeEnv,
+) {
+  const controls = listTaskControlRecords({ activeOnly: Boolean(opts.activeOnly) });
+  if (opts.json) {
+    runtime.log(JSON.stringify({ count: controls.length, controls }, null, 2));
+    return;
+  }
+  if (controls.length === 0) {
+    runtime.log("No task-control records found.");
+    return;
+  }
+  for (const control of controls) {
+    runtime.log(
+      `${control.controlId} ${control.command} ${control.state} scope=${control.scope} requested=${new Date(control.requestedAt).toISOString()}`,
+    );
+  }
+}
+
+export async function tasksControlAckCommand(
+  opts: { controlId: string; detailCode?: string; json?: boolean },
+  runtime: RuntimeEnv,
+) {
+  const control = acknowledgeTaskControl({
+    controlId: opts.controlId,
+    detailCode: opts.detailCode ?? "stopped_by_user",
+  });
+  if (!control) {
+    runtime.error(`Task-control record not found: ${opts.controlId}`);
+    runtime.exit(1);
+    return;
+  }
+  if (opts.json) {
+    runtime.log(JSON.stringify(control, null, 2));
+    return;
+  }
+  runtime.log(
+    `Acknowledged stop ${control.controlId} scope=${control.scope} state=${control.state}.`,
   );
 }
 

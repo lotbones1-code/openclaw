@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import { getShellConfig } from "../../agents/shell-utils.js";
 import { normalizeOptionalString } from "../../shared/string-coerce.js";
+import { containUnacknowledgedStopControls } from "../../tasks/task-control-registry.js";
 import { createChildAdapter } from "./adapters/child.js";
 import { createPtyAdapter } from "./adapters/pty.js";
 import { createRunRegistry } from "./registry.js";
@@ -41,6 +42,7 @@ function isTimeoutReason(reason: TerminationReason) {
 export function createProcessSupervisor(): ProcessSupervisor {
   const registry = createRunRegistry();
   const active = new Map<string, ActiveRun>();
+  let stopContainmentTimer: NodeJS.Timeout | null = null;
 
   const cancel = (runId: string, reason: TerminationReason = "manual-cancel") => {
     const current = active.get(runId);
@@ -65,6 +67,32 @@ export function createProcessSupervisor(): ProcessSupervisor {
     }
   };
 
+  const stopStopContainmentTimer = () => {
+    if (!stopContainmentTimer) {
+      return;
+    }
+    clearInterval(stopContainmentTimer);
+    stopContainmentTimer = null;
+  };
+
+  const runStopContainmentSweep = () => {
+    if (active.size === 0) {
+      stopStopContainmentTimer();
+      return;
+    }
+    containUnacknowledgedStopControls({
+      cancelScope: (scopeKey) => cancelScope(scopeKey, "manual-cancel"),
+    });
+  };
+
+  const ensureStopContainmentTimer = () => {
+    if (stopContainmentTimer) {
+      return;
+    }
+    stopContainmentTimer = setInterval(runStopContainmentSweep, 1_000);
+    stopContainmentTimer.unref?.();
+  };
+
   const spawn = async (input: SpawnInput): Promise<ManagedRun> => {
     const runId = normalizeOptionalString(input.runId) ?? crypto.randomUUID();
     const scopeKey = normalizeOptionalString(input.scopeKey);
@@ -84,6 +112,7 @@ export function createProcessSupervisor(): ProcessSupervisor {
       updatedAtMs: startedAtMs,
     };
     registry.add(record);
+    ensureStopContainmentTimer();
 
     let forcedReason: TerminationReason | null = null;
     let settled = false;
@@ -216,6 +245,9 @@ export function createProcessSupervisor(): ProcessSupervisor {
         clearTimers();
         adapter.dispose();
         active.delete(runId);
+        if (active.size === 0) {
+          stopStopContainmentTimer();
+        }
 
         const reason: TerminationReason =
           forcedReason ?? (result.signal != null ? ("signal" as const) : ("exit" as const));
@@ -240,6 +272,9 @@ export function createProcessSupervisor(): ProcessSupervisor {
           settled = true;
           clearTimers();
           active.delete(runId);
+          if (active.size === 0) {
+            stopStopContainmentTimer();
+          }
           adapter.dispose();
           registry.finalize(runId, {
             reason: "spawn-error",

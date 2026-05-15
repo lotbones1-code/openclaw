@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   onInternalDiagnosticEvent,
   onDiagnosticEvent,
@@ -8,6 +8,12 @@ import {
 } from "../infra/diagnostic-events.js";
 import { resetDiagnosticSessionStateForTest } from "../logging/diagnostic-session-state.js";
 import { getGlobalHookRunner } from "../plugins/hook-runner-global.js";
+import {
+  listTaskControlRecords,
+  requestTaskControlStop,
+  resetTaskControlRegistryForTests,
+} from "../tasks/task-control-registry.js";
+import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
 import {
   runBeforeToolCallHook,
   wrapToolWithBeforeToolCallHook,
@@ -49,6 +55,7 @@ describe("before_tool_call loop detection behavior", () => {
   };
 
   beforeEach(() => {
+    resetTaskControlRegistryForTests();
     resetDiagnosticSessionStateForTest();
     resetDiagnosticEventsForTest();
     hookRunner = {
@@ -57,6 +64,10 @@ describe("before_tool_call loop detection behavior", () => {
     };
     mockGetGlobalHookRunner.mockReturnValue(hookRunner as any);
     hookRunner.hasHooks.mockReturnValue(false);
+  });
+
+  afterEach(() => {
+    resetTaskControlRegistryForTests();
   });
 
   function createWrappedTool(
@@ -69,6 +80,89 @@ describe("before_tool_call loop detection behavior", () => {
       loopDetectionContext,
     );
   }
+
+  it("blocks and acknowledges matching task-control stop records before tool execution", async () => {
+    await withOpenClawTestState(
+      {
+        label: "before-tool-stop-control",
+        applyEnv: true,
+      },
+      async () => {
+        requestTaskControlStop({
+          controlId: "control-before-tool",
+          sessionKey: "agent:main:telegram:personal",
+          source: "test",
+          now: 100,
+        });
+        const execute = vi.fn().mockResolvedValue({
+          content: [{ type: "text", text: "should not execute" }],
+        });
+        const tool = createWrappedTool("read", execute, {
+          agentId: "main",
+          sessionKey: "agent:main:telegram:personal",
+          runId: "run-personal",
+          loopDetection: { enabled: false },
+        });
+
+        const result = await tool.execute?.("tool-call-1", {}, undefined);
+
+        expect(execute).not.toHaveBeenCalled();
+        expect(result).toMatchObject({
+          details: {
+            status: "blocked",
+            deniedReason: "task-control-stop",
+          },
+        });
+        expect(listTaskControlRecords()[0]).toMatchObject({
+          controlId: "control-before-tool",
+          state: "acknowledged",
+          detailCode: "stopped_by_user",
+        });
+      },
+    );
+  });
+
+  it("blocks human browser surfaces before tool execution", async () => {
+    const result = await runBeforeToolCallHook({
+      toolName: "browser.navigate",
+      params: {
+        browserProfile: "user",
+        url: "https://chatgpt.com/",
+      },
+      ctx: {
+        agentId: "main",
+        sessionKey: "agent:main:telegram:personal",
+      },
+    });
+
+    expect(result).toMatchObject({
+      blocked: true,
+      deniedReason: "browser-surface-guard",
+      reason: expect.stringContaining("WRONG_SURFACE_DETECTED"),
+    });
+  });
+
+  it("blocks sensitive account surfaces without exact scoped approval", async () => {
+    const result = await runBeforeToolCallHook({
+      toolName: "browser.navigate",
+      params: {
+        browserProfile: "openclaw-personal",
+        cdpTargetId: "target-1",
+        ownerTaskId: "task-1",
+        url: "https://www.amazon.com/gp/your-account/order-history",
+      },
+      ctx: {
+        agentId: "main",
+        sessionKey: "agent:main:telegram:personal",
+      },
+    });
+
+    expect(result).toMatchObject({
+      blocked: true,
+      deniedReason: "browser-surface-guard",
+      reason: expect.stringContaining("SENSITIVE_ACCOUNT_SURFACE_GATE"),
+    });
+  });
 
   async function withToolLoopEvents(
     run: (emitted: DiagnosticToolLoopEvent[]) => Promise<void>,

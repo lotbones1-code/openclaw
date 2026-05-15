@@ -7,6 +7,9 @@ import { statusCommand } from "../../commands/status.js";
 import {
   tasksAuditCommand,
   tasksCancelCommand,
+  tasksControlAckCommand,
+  tasksControlListCommand,
+  tasksControlRequestStopCommand,
   tasksListCommand,
   tasksMaintenanceCommand,
   tasksNotifyCommand,
@@ -282,7 +285,7 @@ export function registerStatusHealthSessionsCommands(program: Command) {
     .option("--severity <level>", "Filter by severity (warn, error)")
     .option(
       "--code <name>",
-      "Filter by finding code (stale_queued, stale_running, lost, delivery_failed, missing_cleanup, inconsistent_timestamps, restore_failed, stale_waiting, stale_blocked, cancel_stuck, missing_linked_tasks, blocked_task_missing)",
+      "Filter by finding code (stale_queued, stale_running, lost, delivery_failed, missing_cleanup, inconsistent_timestamps, REPORTING_DEFECT, STALE_TASK_WRAPPER, TASK_REGISTRY_MISMATCH, restore_failed, stale_waiting, stale_blocked, cancel_stuck, missing_linked_tasks, blocked_task_missing)",
     )
     .option("--limit <n>", "Limit displayed findings")
     .action(async (opts, command) => {
@@ -299,6 +302,9 @@ export function registerStatusHealthSessionsCommands(program: Command) {
               | "delivery_failed"
               | "missing_cleanup"
               | "inconsistent_timestamps"
+              | "REPORTING_DEFECT"
+              | "STALE_TASK_WRAPPER"
+              | "TASK_REGISTRY_MISMATCH"
               | "restore_failed"
               | "stale_waiting"
               | "stale_blocked"
@@ -375,6 +381,73 @@ export function registerStatusHealthSessionsCommands(program: Command) {
         await tasksCancelCommand(
           {
             lookup,
+          },
+          defaultRuntime,
+        );
+      });
+    });
+
+  const tasksControlCmd = tasksCmd
+    .command("control")
+    .description("Inspect or request native task-control interrupt records");
+
+  tasksControlCmd
+    .command("request-stop")
+    .description("Create a native stop/control record for a task, run, session, or scope")
+    .option("--scope <scope>", "Explicit stop scope")
+    .option("--task-id <id>", "Target task id")
+    .option("--session-key <key>", "Target session key")
+    .option("--run-id <id>", "Target run id")
+    .option("--source <source>", "Stop request source")
+    .option("--reason <reason>", "Stop request reason")
+    .option("--json", "Output as JSON", false)
+    .action(async (opts) => {
+      await runCommandWithRuntime(defaultRuntime, async () => {
+        await tasksControlRequestStopCommand(
+          {
+            scope: opts.scope as string | undefined,
+            taskId: opts.taskId as string | undefined,
+            sessionKey: opts.sessionKey as string | undefined,
+            runId: opts.runId as string | undefined,
+            source: opts.source as string | undefined,
+            reason: opts.reason as string | undefined,
+            json: Boolean(opts.json),
+          },
+          defaultRuntime,
+        );
+      });
+    });
+
+  tasksControlCmd
+    .command("list")
+    .description("List native task-control interrupt records")
+    .option("--json", "Output as JSON", false)
+    .option("--active", "Only show active requested controls", false)
+    .action(async (opts) => {
+      await runCommandWithRuntime(defaultRuntime, async () => {
+        await tasksControlListCommand(
+          {
+            json: Boolean(opts.json),
+            activeOnly: Boolean(opts.active),
+          },
+          defaultRuntime,
+        );
+      });
+    });
+
+  tasksControlCmd
+    .command("ack")
+    .description("Acknowledge a native task-control interrupt record")
+    .argument("<controlId>", "Control record id")
+    .option("--detail-code <code>", "Acknowledgement detail code")
+    .option("--json", "Output as JSON", false)
+    .action(async (controlId, opts) => {
+      await runCommandWithRuntime(defaultRuntime, async () => {
+        await tasksControlAckCommand(
+          {
+            controlId,
+            detailCode: opts.detailCode as string | undefined,
+            json: Boolean(opts.json),
           },
           defaultRuntime,
         );

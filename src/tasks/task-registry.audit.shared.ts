@@ -7,7 +7,10 @@ export type TaskAuditCode =
   | "lost"
   | "delivery_failed"
   | "missing_cleanup"
-  | "inconsistent_timestamps";
+  | "inconsistent_timestamps"
+  | "REPORTING_DEFECT"
+  | "STALE_TASK_WRAPPER"
+  | "TASK_REGISTRY_MISMATCH";
 
 export type TaskAuditFinding = {
   severity: TaskAuditSeverity;
@@ -42,6 +45,9 @@ export function createEmptyTaskAuditSummary(): TaskAuditSummary {
       delivery_failed: 0,
       missing_cleanup: 0,
       inconsistent_timestamps: 0,
+      REPORTING_DEFECT: 0,
+      STALE_TASK_WRAPPER: 0,
+      TASK_REGISTRY_MISMATCH: 0,
     },
   };
 }

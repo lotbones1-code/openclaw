@@ -74,6 +74,28 @@ function findTimestampInconsistency(task: TaskRecord): TaskAuditFinding | null {
   return null;
 }
 
+function findCloseoutDefectClassification(task: TaskRecord): TaskAuditFinding | null {
+  const haystack = [task.error, task.progressSummary, task.terminalSummary, task.terminalOutcome]
+    .filter((value): value is string => typeof value === "string")
+    .join("\n");
+  for (const code of [
+    "REPORTING_DEFECT",
+    "STALE_TASK_WRAPPER",
+    "TASK_REGISTRY_MISMATCH",
+  ] as const) {
+    if (!haystack.includes(code)) {
+      continue;
+    }
+    return createFinding({
+      severity: "error",
+      code,
+      task,
+      detail: code,
+    });
+  }
+  return null;
+}
+
 function compareFindings(left: TaskAuditFinding, right: TaskAuditFinding): number {
   return compareTaskAuditFindingSortKeys(
     {
@@ -172,6 +194,11 @@ export function listTaskAuditFindings(options: TaskAuditOptions = {}): TaskAudit
     const inconsistency = findTimestampInconsistency(task);
     if (inconsistency) {
       findings.push(inconsistency);
+    }
+
+    const closeoutDefect = findCloseoutDefectClassification(task);
+    if (closeoutDefect) {
+      findings.push(closeoutDefect);
     }
   }
 

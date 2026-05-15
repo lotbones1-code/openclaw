@@ -23,7 +23,9 @@ import {
   type PluginHookBeforeToolCallResult,
 } from "../plugins/types.js";
 import { createLazyRuntimeSurface } from "../shared/lazy-runtime.js";
+import { acknowledgeTaskControl, findActiveStopControl } from "../tasks/task-control-registry.js";
 import { isPlainObject } from "../utils.js";
+import { evaluateBrowserSurfaceGuard } from "./browser-surface-guard.js";
 import { copyChannelAgentToolMeta } from "./channel-tools.js";
 import { normalizeToolName } from "./tool-policy.js";
 import type { AnyAgentTool } from "./tools/common.js";
@@ -40,7 +42,12 @@ export type HookContext = {
 };
 
 type HookBlockedKind = "veto" | "failure";
-type HookBlockedReason = "plugin-before-tool-call" | "plugin-approval" | "tool-loop";
+type HookBlockedReason =
+  | "plugin-before-tool-call"
+  | "plugin-approval"
+  | "tool-loop"
+  | "task-control-stop"
+  | "browser-surface-guard";
 type HookOutcome =
   | {
       blocked: true;
@@ -402,6 +409,43 @@ export async function runBeforeToolCallHook(args: {
 }): Promise<HookOutcome> {
   const toolName = normalizeToolName(args.toolName || "tool");
   const params = args.params;
+
+  if (args.ctx?.sessionKey || args.ctx?.runId) {
+    const stopControl = findActiveStopControl({
+      sessionKey: args.ctx?.sessionKey,
+      runId: args.ctx?.runId,
+    });
+    if (stopControl) {
+      acknowledgeTaskControl({
+        controlId: stopControl.controlId,
+        detailCode: "stopped_by_user",
+      });
+      return {
+        blocked: true,
+        kind: "veto",
+        deniedReason: "task-control-stop",
+        reason:
+          "stopped_by_user: task-control stop was requested before this tool call; no fallback lane may start.",
+        params,
+      };
+    }
+  }
+
+  const browserSurface = evaluateBrowserSurfaceGuard({
+    toolName,
+    toolParams: params,
+    sessionKey: args.ctx?.sessionKey,
+    runId: args.ctx?.runId,
+  });
+  if (browserSurface.blocked) {
+    return {
+      blocked: true,
+      kind: "veto",
+      deniedReason: "browser-surface-guard",
+      reason: browserSurface.reason,
+      params,
+    };
+  }
 
   if (args.ctx?.sessionKey) {
     const { getDiagnosticSessionState, logToolLoopAction, detectToolCallLoop, recordToolCall } =
