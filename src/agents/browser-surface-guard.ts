@@ -110,10 +110,14 @@ function isBrowserOrAccountTool(toolName: string, strings: string[]): boolean {
   if (includesPattern(toolName, BROWSER_TOOL_PATTERNS)) {
     return true;
   }
-  if (strings.some((entry) => includesPattern(entry, ["browserprofile", "cdp", "url", "tab"]))) {
+  if (
+    strings.some((entry) =>
+      /(^|\.)(browserProfile|cdpTargetId|cdpSessionId|targetId|url|tabId)=/i.test(entry),
+    )
+  ) {
     return true;
   }
-  return hasSensitiveSurface(strings) || hasHumanSurface(strings);
+  return false;
 }
 
 function hasHumanSurface(strings: string[]): boolean {

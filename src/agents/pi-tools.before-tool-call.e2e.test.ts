@@ -164,6 +164,24 @@ describe("before_tool_call loop detection behavior", () => {
     });
   });
 
+  it("does not treat local file paths with Users as human browser surfaces", async () => {
+    const result = await runBeforeToolCallHook({
+      toolName: "write",
+      params: {
+        path: "/Users/shamil/.openclaw/subagents/reports/social-steward-tick.md",
+        content: "# tick\n\nstart\n",
+      },
+      ctx: {
+        agentId: "main",
+        sessionKey: "agent:main:cron:social",
+      },
+    });
+
+    expect(result).toMatchObject({
+      blocked: false,
+    });
+  });
+
   async function withToolLoopEvents(
     run: (emitted: DiagnosticToolLoopEvent[]) => Promise<void>,
     filter: (evt: DiagnosticToolLoopEvent) => boolean = () => true,
