@@ -29,6 +29,7 @@ type SensitiveAction = {
       : never
     : never;
   reason: string;
+  alwaysBlock?: boolean;
 };
 
 const SHELL_TOOL_PATTERNS = ["bash", "shell", "exec", "command", "terminal", "run"] as const;
@@ -178,7 +179,9 @@ function inferSensitiveAction(params: {
       lockId: "b2b:send",
       action: "b2b_send",
       code: "SEND_LOCKED",
-      reason: "SEND_LOCKED: B2B/Gmail/SMTP sending requires an exact single-use native unlock.",
+      reason:
+        "SEND_LOCKED: direct B2B/Gmail/SMTP sender execution is blocked outside a native OpenClaw send lane.",
+      alwaysBlock: true,
     };
   }
 
@@ -189,6 +192,7 @@ function inferSensitiveAction(params: {
       code: "NON_NATIVE_TOOLING_BLOCKED",
       reason:
         "NON_NATIVE_TOOLING_BLOCKED: generated SMTP sender files must be quarantined or native-gated, not rewritten as executable senders.",
+      alwaysBlock: true,
     };
   }
 
@@ -202,6 +206,7 @@ function inferSensitiveAction(params: {
       code: "NON_NATIVE_TOOLING_BLOCKED",
       reason:
         "NON_NATIVE_TOOLING_BLOCKED: direct Python/email sender execution is blocked outside a native OpenClaw send lane.",
+      alwaysBlock: true,
     };
   }
 
@@ -212,6 +217,7 @@ function inferSensitiveAction(params: {
       code: "NON_NATIVE_TOOLING_BLOCKED",
       reason:
         "NON_NATIVE_TOOLING_BLOCKED: direct provider/API mutation scripts must be converted to native OpenClaw adapters with policy-lock checks.",
+      alwaysBlock: true,
     };
   }
 
@@ -279,6 +285,27 @@ export function evaluatePolicyLockGuard(params: {
   });
   if (!sensitive) {
     return { blocked: false };
+  }
+
+  if (sensitive.alwaysBlock) {
+    appendPolicyLockAudit({
+      lockId: sensitive.lockId,
+      sessionKey: params.sessionKey,
+      runId: params.runId,
+      action: sensitive.action,
+      source: "before-tool-policy-guard",
+      channel: params.toolName,
+      decision: "DENIED",
+      reasonCode: sensitive.code,
+      detail: sensitive.reason,
+    });
+
+    return {
+      blocked: true,
+      code: sensitive.code,
+      lockId: sensitive.lockId,
+      reason: sensitive.reason,
+    };
   }
 
   const lock = getPolicyLock(sensitive.lockId);

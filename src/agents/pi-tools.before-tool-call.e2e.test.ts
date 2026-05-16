@@ -263,6 +263,41 @@ describe("before_tool_call loop detection behavior", () => {
     );
   });
 
+  it("still blocks non-native SMTP sender scripts when send lock is relaxed", async () => {
+    await withOpenClawTestState(
+      {
+        label: "before-tool-send-script-native-only",
+        applyEnv: true,
+      },
+      async () => {
+        setPolicyLock({
+          lockId: "b2b:send",
+          state: "UNLOCKED",
+          source: "test",
+          now: 100,
+        });
+
+        const result = await runBeforeToolCallHook({
+          toolName: "bash.exec",
+          params: {
+            cmd: "python engine/content/b2b_outreach/send_clinic_batch.py --execute",
+          },
+          ctx: {
+            agentId: "main",
+            sessionKey: "agent:main:subagent:b2b",
+            runId: "run-b2b",
+          },
+        });
+
+        expect(result).toMatchObject({
+          blocked: true,
+          deniedReason: "policy-lock-guard",
+          reason: expect.stringContaining("native OpenClaw send lane"),
+        });
+      },
+    );
+  });
+
   it("blocks direct provider API mutation scripts outside native adapters", async () => {
     await withOpenClawTestState(
       {
@@ -298,6 +333,41 @@ describe("before_tool_call loop detection behavior", () => {
     );
   });
 
+  it("still blocks direct provider API scripts when provider mutation lock is relaxed", async () => {
+    await withOpenClawTestState(
+      {
+        label: "before-tool-direct-provider-api-native-only",
+        applyEnv: true,
+      },
+      async () => {
+        setPolicyLock({
+          lockId: "api:provider_mutation",
+          state: "UNLOCKED",
+          source: "test",
+          now: 100,
+        });
+
+        const result = await runBeforeToolCallHook({
+          toolName: "bash.exec",
+          params: {
+            cmd: "python engine/content/brand_publisher.py --publish --graph-facebook-com",
+          },
+          ctx: {
+            agentId: "main",
+            sessionKey: "agent:main:subagent:social",
+            runId: "run-provider",
+          },
+        });
+
+        expect(result).toMatchObject({
+          blocked: true,
+          deniedReason: "policy-lock-guard",
+          reason: expect.stringContaining("native OpenClaw adapters"),
+        });
+      },
+    );
+  });
+
   it("consumes an exact synthetic unlock once for a matching sensitive action", async () => {
     await withOpenClawTestState(
       {
@@ -306,22 +376,22 @@ describe("before_tool_call loop detection behavior", () => {
       },
       async () => {
         setPolicyLock({
-          lockId: "b2b:send",
+          lockId: "public_social:post",
           state: "LOCKED",
           source: "test",
           now: 100,
         });
         createPolicyUnlock({
           unlockId: "unlock-before-tool",
-          lockId: "b2b:send",
+          lockId: "public_social:post",
           taskId: "task-1",
-          lane: "b2b_send",
-          action: "b2b_send",
-          account: "gmail",
-          targetClass: "clinic",
-          approvalText: "synthetic one-send proof",
+          lane: "social_publish",
+          action: "public_social_mutation",
+          account: "@titan.peptidelab",
+          targetClass: "owned_instagram_profile",
+          approvalText: "synthetic one-post proof",
           proofPath: "/tmp/p07-proof.md",
-          stopInstruction: "stop b2b",
+          stopInstruction: "stop social publish",
           rollbackInstruction: "do not retry",
           now: 120,
           expiresAt: Date.now() + 60_000,
@@ -329,13 +399,14 @@ describe("before_tool_call loop detection behavior", () => {
         });
 
         const first = await runBeforeToolCallHook({
-          toolName: "bash.exec",
+          toolName: "browser.action",
           params: {
-            cmd: "python engine/content/b2b_outreach/send_clinic_batch.py --execute",
+            url: "https://www.instagram.com",
+            action: "upload post",
             taskId: "task-1",
-            lane: "b2b_send",
-            account: "gmail",
-            targetClass: "clinic",
+            lane: "social_publish",
+            account: "@titan.peptidelab",
+            targetClass: "owned_instagram_profile",
             exactPolicyUnlock: true,
           },
           ctx: {
@@ -345,13 +416,14 @@ describe("before_tool_call loop detection behavior", () => {
           },
         });
         const second = await runBeforeToolCallHook({
-          toolName: "bash.exec",
+          toolName: "browser.action",
           params: {
-            cmd: "python engine/content/b2b_outreach/send_clinic_batch.py --execute",
+            url: "https://www.instagram.com",
+            action: "upload post",
             taskId: "task-1",
-            lane: "b2b_send",
-            account: "gmail",
-            targetClass: "clinic",
+            lane: "social_publish",
+            account: "@titan.peptidelab",
+            targetClass: "owned_instagram_profile",
             exactPolicyUnlock: true,
           },
           ctx: {
