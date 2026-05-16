@@ -23,7 +23,7 @@ const MARKER_RE =
 function resolveBrevityConfig(cfg: OpenClawConfig): CronNotificationBrevityConfig {
   const raw = cfg.cron?.notifications?.telegram;
   return {
-    style: raw?.style === "brief" ? "brief" : "default",
+    style: raw?.style === "default" ? "default" : "brief",
     maxLines: normalizePositiveInt(raw?.maxLines) ?? DEFAULT_MAX_LINES,
     maxChars: normalizePositiveInt(raw?.maxChars) ?? DEFAULT_MAX_CHARS,
     includeReportPaths: raw?.includeReportPaths !== false,
