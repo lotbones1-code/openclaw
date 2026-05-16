@@ -55,6 +55,7 @@ const DEFAULT_MISSED_JOB_STAGGER_MS = 5_000;
 const DEFAULT_MAX_MISSED_JOBS_PER_RESTART = 5;
 const DEFAULT_FAILURE_ALERT_AFTER = 2;
 const DEFAULT_FAILURE_ALERT_COOLDOWN_MS = 60 * 60_000; // 1 hour
+const RECURRING_TIMEOUT_QUARANTINE_AFTER = 3;
 
 type ResolvedFailureAlert = {
   after: number;
@@ -138,6 +139,59 @@ function resolveRunConcurrency(state: CronServiceState): number {
 }
 function timeoutErrorMessage(): string {
   return "cron: job execution timed out";
+}
+
+function isTimeoutRunError(error: unknown): boolean {
+  return normalizeCronRunErrorText(error) === timeoutErrorMessage();
+}
+
+function shouldQuarantineRecurringTimeoutLoop(
+  job: CronJob,
+  result: { status: CronRunStatus; error?: string },
+) {
+  return (
+    result.status === "error" &&
+    job.schedule.kind !== "at" &&
+    isTimeoutRunError(result.error) &&
+    (job.state.consecutiveErrors ?? 0) >= RECURRING_TIMEOUT_QUARANTINE_AFTER
+  );
+}
+
+function shouldQuarantineStoredRecurringTimeoutLoop(job: CronJob) {
+  return (
+    isJobEnabled(job) &&
+    job.schedule.kind !== "at" &&
+    typeof job.state.runningAtMs !== "number" &&
+    (job.state.lastStatus === "error" || job.state.lastRunStatus === "error") &&
+    isTimeoutRunError(job.state.lastError) &&
+    (job.state.consecutiveErrors ?? 0) >= RECURRING_TIMEOUT_QUARANTINE_AFTER
+  );
+}
+
+function quarantineRecurringTimeoutLoop(state: CronServiceState, job: CronJob) {
+  job.enabled = false;
+  job.state.nextRunAtMs = undefined;
+  job.state.lastError = `cron: job auto-quarantined after ${job.state.consecutiveErrors ?? RECURRING_TIMEOUT_QUARANTINE_AFTER} consecutive timeouts`;
+  state.deps.log.warn(
+    {
+      jobId: job.id,
+      jobName: job.name,
+      consecutiveErrors: job.state.consecutiveErrors,
+    },
+    "cron: auto-quarantined recurring job after repeated timeouts",
+  );
+}
+
+function quarantineStoredRecurringTimeoutLoops(state: CronServiceState): boolean {
+  let changed = false;
+  for (const job of state.store?.jobs ?? []) {
+    if (!shouldQuarantineStoredRecurringTimeoutLoop(job)) {
+      continue;
+    }
+    quarantineRecurringTimeoutLoop(state, job);
+    changed = true;
+  }
+  return changed;
 }
 
 function isAbortError(err: unknown): boolean {
@@ -499,6 +553,9 @@ export function applyJobResult(
       error: result.error,
       consecutiveCount: job.state.consecutiveErrors,
     });
+    if (shouldQuarantineRecurringTimeoutLoop(job, result)) {
+      quarantineRecurringTimeoutLoop(state, job);
+    }
   } else if (result.status === "skipped") {
     job.state.consecutiveErrors = 0;
     job.state.consecutiveSkipped = (job.state.consecutiveSkipped ?? 0) + 1;
@@ -765,6 +822,7 @@ export async function onTimer(state: CronServiceState) {
   try {
     const dueJobs = await locked(state, async () => {
       await ensureLoaded(state, { forceReload: true, skipRecompute: true });
+      const quarantinedStoredTimeoutLoops = quarantineStoredRecurringTimeoutLoops(state);
       const dueCheckNow = state.deps.nowMs();
       const due = collectRunnableJobs(state, dueCheckNow);
 
@@ -776,7 +834,7 @@ export async function onTimer(state: CronServiceState) {
           recomputeExpired: true,
           nowMs: dueCheckNow,
         });
-        if (changed) {
+        if (quarantinedStoredTimeoutLoops || changed) {
           await persist(state);
         }
         return [];
