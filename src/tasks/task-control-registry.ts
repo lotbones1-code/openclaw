@@ -57,6 +57,7 @@ type TaskControlStatements = {
   upsertRecord: StatementSync;
   acknowledgeRecord: StatementSync;
   containRecord: StatementSync;
+  denyResumeRecord: StatementSync;
 };
 
 type TaskControlDatabase = {
@@ -254,6 +255,12 @@ function createStatements(db: DatabaseSync): TaskControlStatements {
         detail_code = COALESCE(?, detail_code)
       WHERE control_id = ?
     `),
+    denyResumeRecord: db.prepare(`
+      UPDATE task_control_records
+      SET
+        detail_code = ?
+      WHERE control_id = ?
+    `),
   };
 }
 
@@ -395,6 +402,77 @@ function commandIsStopLike(command: TaskControlCommand): boolean {
   );
 }
 
+const SENSITIVE_CONTROL_PATTERNS = [
+  "b2b",
+  "smtp",
+  "gmail",
+  "email send",
+  "send worker",
+  "external-send",
+  "public-send",
+  "post",
+  "comment",
+  "dm",
+  "payment",
+  "refund",
+  "order",
+  "checkout",
+  "dns",
+  "mailbox",
+  "admin",
+  "account security",
+  "provider",
+  "api mutation",
+  "platform-warning",
+] as const;
+
+const BROAD_RESUME_PATTERNS = [
+  "explicit_resume",
+  "boss_directive",
+  "go_get_sales",
+  "unlock_everything",
+  "do_everything",
+  "work_overnight",
+  "try_harder",
+  "resume_current",
+] as const;
+
+function includesPattern(value: string, patterns: readonly string[]): boolean {
+  const lower = value.toLowerCase();
+  return patterns.some((pattern) => lower.includes(pattern));
+}
+
+function taskControlRecordSearchText(record: TaskControlRecord): string {
+  return [
+    record.command,
+    record.scope,
+    record.taskId,
+    record.sessionKey,
+    record.runId,
+    record.source,
+    record.reason,
+    record.resumeCondition,
+    record.detailCode,
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+export function isSensitiveTaskControlRecord(record: TaskControlRecord): boolean {
+  return includesPattern(taskControlRecordSearchText(record), SENSITIVE_CONTROL_PATTERNS);
+}
+
+export function isBroadResumeDetailCode(detailCode: string | undefined): boolean {
+  const normalized = normalizeOptionalString(detailCode);
+  if (!normalized) {
+    return false;
+  }
+  if (normalized.toLowerCase().includes("unlock_id:")) {
+    return false;
+  }
+  return includesPattern(normalized, BROAD_RESUME_PATTERNS);
+}
+
 function recordMatchesContext(
   record: TaskControlRecord,
   params: {
@@ -449,9 +527,16 @@ export function acknowledgeTaskControl(params: {
   if (!controlId) {
     return null;
   }
+  const existing =
+    listTaskControlRecords().find((record) => record.controlId === controlId) ?? null;
+  const detailCode = normalizeOptionalString(params.detailCode) ?? "stopped_by_user";
+  if (existing && isSensitiveTaskControlRecord(existing) && isBroadResumeDetailCode(detailCode)) {
+    openTaskControlDatabase().statements.denyResumeRecord.run("SENSITIVE_RESUME_DENIED", controlId);
+    return listTaskControlRecords().find((record) => record.controlId === controlId) ?? null;
+  }
   openTaskControlDatabase().statements.acknowledgeRecord.run(
     params.now ?? Date.now(),
-    normalizeOptionalString(params.detailCode) ?? "stopped_by_user",
+    detailCode,
     controlId,
   );
   return listTaskControlRecords().find((record) => record.controlId === controlId) ?? null;

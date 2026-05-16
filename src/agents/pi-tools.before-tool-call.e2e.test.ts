@@ -9,6 +9,12 @@ import {
 import { resetDiagnosticSessionStateForTest } from "../logging/diagnostic-session-state.js";
 import { getGlobalHookRunner } from "../plugins/hook-runner-global.js";
 import {
+  createPolicyUnlock,
+  listPolicyLockAudit,
+  resetPolicyLockRegistryForTests,
+  setPolicyLock,
+} from "../tasks/policy-lock-registry.js";
+import {
   listTaskControlRecords,
   requestTaskControlStop,
   resetTaskControlRegistryForTests,
@@ -56,6 +62,7 @@ describe("before_tool_call loop detection behavior", () => {
 
   beforeEach(() => {
     resetTaskControlRegistryForTests();
+    resetPolicyLockRegistryForTests();
     resetDiagnosticSessionStateForTest();
     resetDiagnosticEventsForTest();
     hookRunner = {
@@ -68,6 +75,7 @@ describe("before_tool_call loop detection behavior", () => {
 
   afterEach(() => {
     resetTaskControlRegistryForTests();
+    resetPolicyLockRegistryForTests();
   });
 
   function createWrappedTool(
@@ -180,6 +188,187 @@ describe("before_tool_call loop detection behavior", () => {
     expect(result).toMatchObject({
       blocked: false,
     });
+  });
+
+  it("blocks B2B SMTP sender execution while send lock is active", async () => {
+    await withOpenClawTestState(
+      {
+        label: "before-tool-send-lock",
+        applyEnv: true,
+      },
+      async () => {
+        setPolicyLock({
+          lockId: "b2b:send",
+          state: "LOCKED",
+          source: "test",
+          now: 100,
+        });
+
+        const result = await runBeforeToolCallHook({
+          toolName: "bash.exec",
+          params: {
+            cmd: "python engine/content/b2b_outreach/send_clinic_batch.py --execute",
+          },
+          ctx: {
+            agentId: "main",
+            sessionKey: "agent:main:subagent:b2b",
+            runId: "run-b2b",
+          },
+        });
+
+        expect(result).toMatchObject({
+          blocked: true,
+          deniedReason: "policy-lock-guard",
+          reason: expect.stringContaining("SEND_LOCKED"),
+        });
+        expect(listPolicyLockAudit()[0]).toMatchObject({
+          lockId: "b2b:send",
+          decision: "DENIED",
+          reasonCode: "SEND_LOCKED",
+        });
+      },
+    );
+  });
+
+  it("allows safe B2B no-send enrichment while send lock is active", async () => {
+    await withOpenClawTestState(
+      {
+        label: "before-tool-no-send-safe",
+        applyEnv: true,
+      },
+      async () => {
+        setPolicyLock({
+          lockId: "b2b:send",
+          state: "LOCKED",
+          source: "test",
+          now: 100,
+        });
+
+        const result = await runBeforeToolCallHook({
+          toolName: "bash.exec",
+          params: {
+            cmd: "python engine/content/b2b_outreach/build_compliant_drafts_20260515.py --dry-run",
+          },
+          ctx: {
+            agentId: "main",
+            sessionKey: "agent:main:cron:work-pulse",
+            runId: "run-safe",
+          },
+        });
+
+        expect(result).toMatchObject({
+          blocked: false,
+        });
+      },
+    );
+  });
+
+  it("blocks direct provider API mutation scripts outside native adapters", async () => {
+    await withOpenClawTestState(
+      {
+        label: "before-tool-direct-provider-api",
+        applyEnv: true,
+      },
+      async () => {
+        setPolicyLock({
+          lockId: "api:provider_mutation",
+          state: "LOCKED",
+          source: "test",
+          now: 100,
+        });
+
+        const result = await runBeforeToolCallHook({
+          toolName: "bash.exec",
+          params: {
+            cmd: "python engine/content/brand_publisher.py --publish --graph-facebook-com",
+          },
+          ctx: {
+            agentId: "main",
+            sessionKey: "agent:main:subagent:social",
+            runId: "run-provider",
+          },
+        });
+
+        expect(result).toMatchObject({
+          blocked: true,
+          deniedReason: "policy-lock-guard",
+          reason: expect.stringContaining("NON_NATIVE_TOOLING_BLOCKED"),
+        });
+      },
+    );
+  });
+
+  it("consumes an exact synthetic unlock once for a matching sensitive action", async () => {
+    await withOpenClawTestState(
+      {
+        label: "before-tool-single-use-unlock",
+        applyEnv: true,
+      },
+      async () => {
+        setPolicyLock({
+          lockId: "b2b:send",
+          state: "LOCKED",
+          source: "test",
+          now: 100,
+        });
+        createPolicyUnlock({
+          unlockId: "unlock-before-tool",
+          lockId: "b2b:send",
+          taskId: "task-1",
+          lane: "b2b_send",
+          action: "b2b_send",
+          account: "gmail",
+          targetClass: "clinic",
+          approvalText: "synthetic one-send proof",
+          proofPath: "/tmp/p07-proof.md",
+          stopInstruction: "stop b2b",
+          rollbackInstruction: "do not retry",
+          now: 120,
+          expiresAt: Date.now() + 60_000,
+          source: "test",
+        });
+
+        const first = await runBeforeToolCallHook({
+          toolName: "bash.exec",
+          params: {
+            cmd: "python engine/content/b2b_outreach/send_clinic_batch.py --execute",
+            taskId: "task-1",
+            lane: "b2b_send",
+            account: "gmail",
+            targetClass: "clinic",
+            exactPolicyUnlock: true,
+          },
+          ctx: {
+            agentId: "main",
+            sessionKey: "agent:main:subagent:b2b",
+            runId: "run-b2b",
+          },
+        });
+        const second = await runBeforeToolCallHook({
+          toolName: "bash.exec",
+          params: {
+            cmd: "python engine/content/b2b_outreach/send_clinic_batch.py --execute",
+            taskId: "task-1",
+            lane: "b2b_send",
+            account: "gmail",
+            targetClass: "clinic",
+            exactPolicyUnlock: true,
+          },
+          ctx: {
+            agentId: "main",
+            sessionKey: "agent:main:subagent:b2b",
+            runId: "run-b2b",
+          },
+        });
+
+        expect(first).toMatchObject({ blocked: false });
+        expect(second).toMatchObject({
+          blocked: true,
+          deniedReason: "policy-lock-guard",
+          reason: expect.stringContaining("SEND_LOCKED"),
+        });
+      },
+    );
   });
 
   async function withToolLoopEvents(

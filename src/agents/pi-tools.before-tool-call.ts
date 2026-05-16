@@ -27,6 +27,7 @@ import { acknowledgeTaskControl, findActiveStopControl } from "../tasks/task-con
 import { isPlainObject } from "../utils.js";
 import { evaluateBrowserSurfaceGuard } from "./browser-surface-guard.js";
 import { copyChannelAgentToolMeta } from "./channel-tools.js";
+import { evaluatePolicyLockGuard } from "./policy-lock-guard.js";
 import { normalizeToolName } from "./tool-policy.js";
 import type { AnyAgentTool } from "./tools/common.js";
 import { callGatewayTool } from "./tools/gateway.js";
@@ -47,6 +48,7 @@ type HookBlockedReason =
   | "plugin-approval"
   | "tool-loop"
   | "task-control-stop"
+  | "policy-lock-guard"
   | "browser-surface-guard";
 type HookOutcome =
   | {
@@ -429,6 +431,22 @@ export async function runBeforeToolCallHook(args: {
         params,
       };
     }
+  }
+
+  const policyLock = evaluatePolicyLockGuard({
+    toolName,
+    toolParams: params,
+    sessionKey: args.ctx?.sessionKey,
+    runId: args.ctx?.runId,
+  });
+  if (policyLock.blocked) {
+    return {
+      blocked: true,
+      kind: "veto",
+      deniedReason: "policy-lock-guard",
+      reason: policyLock.reason,
+      params,
+    };
   }
 
   const browserSurface = evaluateBrowserSurfaceGuard({

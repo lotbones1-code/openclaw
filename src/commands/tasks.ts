@@ -2,6 +2,14 @@ import { getRuntimeConfig } from "../config/config.js";
 import { resolveCronStorePath } from "../cron/store.js";
 import type { RuntimeEnv } from "../runtime.js";
 import { normalizeOptionalString } from "../shared/string-coerce.js";
+import {
+  createPolicyUnlock,
+  listPolicyLockAudit,
+  listPolicyLocks,
+  listPolicyUnlocks,
+  setPolicyLock,
+  type PolicyLockState,
+} from "../tasks/policy-lock-registry.js";
 import { getTaskById, updateTaskNotifyPolicyById } from "../tasks/runtime-internal.js";
 import {
   acknowledgeTaskControl,
@@ -489,6 +497,129 @@ export async function tasksControlAckCommand(
   runtime.log(
     `Acknowledged stop ${control.controlId} scope=${control.scope} state=${control.state}.`,
   );
+}
+
+export async function tasksLocksListCommand(
+  opts: { json?: boolean; includeUnlocks?: boolean },
+  runtime: RuntimeEnv,
+) {
+  const locks = listPolicyLocks();
+  const unlocks = opts.includeUnlocks ? listPolicyUnlocks() : undefined;
+  if (opts.json) {
+    runtime.log(
+      JSON.stringify(
+        {
+          count: locks.length,
+          locks,
+          ...(unlocks ? { unlocks } : {}),
+        },
+        null,
+        2,
+      ),
+    );
+    return;
+  }
+  for (const lock of locks) {
+    runtime.log(`${lock.lockId} ${lock.state} updated=${new Date(lock.updatedAt).toISOString()}`);
+  }
+}
+
+export async function tasksLocksSetCommand(
+  opts: {
+    lockId: string;
+    state?: string;
+    source?: string;
+    reason?: string;
+    json?: boolean;
+  },
+  runtime: RuntimeEnv,
+) {
+  const normalizedState = opts.state?.trim().toUpperCase() || "LOCKED";
+  if (normalizedState !== "LOCKED" && normalizedState !== "UNLOCKED") {
+    runtime.error(`Invalid lock state: ${opts.state ?? ""}`);
+    runtime.exit(1);
+    return;
+  }
+  const lock = setPolicyLock({
+    lockId: opts.lockId,
+    state: normalizedState as PolicyLockState,
+    source: opts.source ?? "cli.tasks-locks",
+    reason: opts.reason ?? "operator-request",
+  });
+  if (opts.json) {
+    runtime.log(JSON.stringify(lock, null, 2));
+    return;
+  }
+  runtime.log(`Set lock ${lock.lockId} ${lock.state}.`);
+}
+
+export async function tasksLocksUnlockCommand(
+  opts: {
+    lockId: string;
+    taskId?: string;
+    lane?: string;
+    action?: string;
+    account?: string;
+    targetClass?: string;
+    recipientHash?: string;
+    templateId?: string;
+    maxCount?: string;
+    cadence?: string;
+    approvalText?: string;
+    proofPath?: string;
+    stopInstruction?: string;
+    rollbackInstruction?: string;
+    ttlMs?: number;
+    source?: string;
+    json?: boolean;
+  },
+  runtime: RuntimeEnv,
+) {
+  try {
+    const unlock = createPolicyUnlock({
+      lockId: opts.lockId,
+      taskId: opts.taskId,
+      lane: opts.lane,
+      action: opts.action,
+      account: opts.account,
+      targetClass: opts.targetClass,
+      recipientHash: opts.recipientHash,
+      templateId: opts.templateId,
+      maxCount: opts.maxCount,
+      cadence: opts.cadence,
+      approvalText: opts.approvalText,
+      proofPath: opts.proofPath,
+      stopInstruction: opts.stopInstruction,
+      rollbackInstruction: opts.rollbackInstruction,
+      ttlMs: opts.ttlMs,
+      source: opts.source ?? "cli.tasks-locks",
+    });
+    if (opts.json) {
+      runtime.log(JSON.stringify(unlock, null, 2));
+      return;
+    }
+    runtime.log(`Created single-use unlock ${unlock.unlockId} for ${unlock.lockId}.`);
+  } catch (err) {
+    runtime.error(err instanceof Error ? err.message : String(err));
+    runtime.exit(1);
+  }
+}
+
+export async function tasksLocksAuditCommand(opts: { json?: boolean }, runtime: RuntimeEnv) {
+  const audit = listPolicyLockAudit();
+  if (opts.json) {
+    runtime.log(JSON.stringify({ count: audit.length, audit }, null, 2));
+    return;
+  }
+  if (audit.length === 0) {
+    runtime.log("No policy-lock audit records found.");
+    return;
+  }
+  for (const row of audit) {
+    runtime.log(
+      `${row.auditId} ${row.decision} ${row.reasonCode} lock=${row.lockId ?? "n/a"} ts=${new Date(row.timestamp).toISOString()}`,
+    );
+  }
 }
 
 export async function tasksAuditCommand(

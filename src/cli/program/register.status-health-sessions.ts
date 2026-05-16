@@ -10,6 +10,10 @@ import {
   tasksControlAckCommand,
   tasksControlListCommand,
   tasksControlRequestStopCommand,
+  tasksLocksAuditCommand,
+  tasksLocksListCommand,
+  tasksLocksSetCommand,
+  tasksLocksUnlockCommand,
   tasksListCommand,
   tasksMaintenanceCommand,
   tasksNotifyCommand,
@@ -451,6 +455,107 @@ export function registerStatusHealthSessionsCommands(program: Command) {
           },
           defaultRuntime,
         );
+      });
+    });
+
+  const tasksLocksCmd = tasksCmd
+    .command("locks")
+    .description("Inspect or mutate native sensitive-action policy locks");
+
+  tasksLocksCmd
+    .command("list")
+    .description("List native policy locks")
+    .option("--json", "Output as JSON", false)
+    .option("--include-unlocks", "Include single-use unlock records", false)
+    .action(async (opts) => {
+      await runCommandWithRuntime(defaultRuntime, async () => {
+        await tasksLocksListCommand(
+          {
+            json: Boolean(opts.json),
+            includeUnlocks: Boolean(opts.includeUnlocks),
+          },
+          defaultRuntime,
+        );
+      });
+    });
+
+  tasksLocksCmd
+    .command("set")
+    .description("Set a native policy lock state")
+    .argument("<lockId>", "Policy lock id, e.g. b2b:send")
+    .option("--state <state>", "LOCKED or UNLOCKED", "LOCKED")
+    .option("--source <source>", "Lock source")
+    .option("--reason <reason>", "Lock reason")
+    .option("--json", "Output as JSON", false)
+    .action(async (lockId, opts) => {
+      await runCommandWithRuntime(defaultRuntime, async () => {
+        await tasksLocksSetCommand(
+          {
+            lockId,
+            state: opts.state as string | undefined,
+            source: opts.source as string | undefined,
+            reason: opts.reason as string | undefined,
+            json: Boolean(opts.json),
+          },
+          defaultRuntime,
+        );
+      });
+    });
+
+  tasksLocksCmd
+    .command("unlock")
+    .description("Create a single-use, time-boxed native unlock")
+    .argument("<lockId>", "Policy lock id")
+    .requiredOption("--task-id <id>", "Task id this unlock is bound to")
+    .requiredOption("--lane <lane>", "Lane this unlock is bound to")
+    .requiredOption("--action <action>", "Action this unlock is bound to")
+    .requiredOption("--account <account>", "Account/channel this unlock is bound to")
+    .requiredOption("--target-class <class>", "Target class this unlock is bound to")
+    .option("--recipient-hash <hash>", "Recipient or segment hash")
+    .option("--template-id <id>", "Template id")
+    .option("--max-count <count>", "Max count")
+    .option("--cadence <cadence>", "Cadence")
+    .requiredOption("--approval-text <text>", "Exact approval text")
+    .requiredOption("--proof-path <path>", "Proof path")
+    .requiredOption("--stop-instruction <instruction>", "Stop instruction")
+    .requiredOption("--rollback-instruction <instruction>", "Rollback or containment instruction")
+    .option("--ttl-ms <ms>", "Unlock TTL in milliseconds")
+    .option("--source <source>", "Unlock source")
+    .option("--json", "Output as JSON", false)
+    .action(async (lockId, opts) => {
+      await runCommandWithRuntime(defaultRuntime, async () => {
+        await tasksLocksUnlockCommand(
+          {
+            lockId,
+            taskId: opts.taskId as string | undefined,
+            lane: opts.lane as string | undefined,
+            action: opts.action as string | undefined,
+            account: opts.account as string | undefined,
+            targetClass: opts.targetClass as string | undefined,
+            recipientHash: opts.recipientHash as string | undefined,
+            templateId: opts.templateId as string | undefined,
+            maxCount: opts.maxCount as string | undefined,
+            cadence: opts.cadence as string | undefined,
+            approvalText: opts.approvalText as string | undefined,
+            proofPath: opts.proofPath as string | undefined,
+            stopInstruction: opts.stopInstruction as string | undefined,
+            rollbackInstruction: opts.rollbackInstruction as string | undefined,
+            ttlMs: parsePositiveIntOrUndefined(opts.ttlMs),
+            source: opts.source as string | undefined,
+            json: Boolean(opts.json),
+          },
+          defaultRuntime,
+        );
+      });
+    });
+
+  tasksLocksCmd
+    .command("audit")
+    .description("List native policy-lock audit records")
+    .option("--json", "Output as JSON", false)
+    .action(async (opts) => {
+      await runCommandWithRuntime(defaultRuntime, async () => {
+        await tasksLocksAuditCommand({ json: Boolean(opts.json) }, defaultRuntime);
       });
     });
 

@@ -87,4 +87,36 @@ describe("task-control registry", () => {
       },
     );
   });
+
+  it("does not acknowledge sensitive stopped work with broad resume detail codes", async () => {
+    await withOpenClawTestState(
+      {
+        label: "task-control-sensitive-resume-deny",
+        applyEnv: true,
+      },
+      async () => {
+        requestTaskControlStop({
+          controlId: "control-b2b-stop",
+          scope: "task:b2b-email-sends-20260515",
+          taskId: "b2b-email-sends-20260515",
+          source: "test",
+          reason: "B2B Gmail SMTP send worker stopped",
+          now: 100,
+        });
+
+        const denied = acknowledgeTaskControl({
+          controlId: "control-b2b-stop",
+          now: 150,
+          detailCode: "explicit_resume_current_boss_directive_36090",
+        });
+
+        expect(denied).toMatchObject({
+          controlId: "control-b2b-stop",
+          state: "requested",
+          detailCode: "SENSITIVE_RESUME_DENIED",
+        });
+        expect(listTaskControlRecords({ activeOnly: true })).toHaveLength(1);
+      },
+    );
+  });
 });
