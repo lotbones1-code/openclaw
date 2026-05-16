@@ -41,6 +41,30 @@ describe("reparseProgramFromActionArgs", () => {
     expect(parseAsync).toHaveBeenCalledWith(["node", "openclaw", "status"]);
   });
 
+  it("reparses from the root program raw args when available", async () => {
+    const program = new Command().name("openclaw") as Command & { rawArgs?: string[] };
+    program.rawArgs = ["node", "openclaw", "browser", "--browser-profile", "titan-ig", "status"];
+    const parseAsync = vi.spyOn(program, "parseAsync").mockResolvedValue(program);
+    const browserCommand = new Command("browser");
+    browserCommand.parent = program;
+    const actionCommand = {
+      name: () => "status",
+      parent: browserCommand,
+    } as unknown as Command;
+
+    await reparseProgramFromActionArgs(browserCommand, [actionCommand]);
+
+    expect(buildParseArgvMock).not.toHaveBeenCalled();
+    expect(parseAsync).toHaveBeenCalledWith([
+      "node",
+      "openclaw",
+      "browser",
+      "--browser-profile",
+      "titan-ig",
+      "status",
+    ]);
+  });
+
   it("falls back to action args without command name when action has no name", async () => {
     const program = new Command().name("openclaw");
     const parseAsync = vi.spyOn(program, "parseAsync").mockResolvedValue(program);

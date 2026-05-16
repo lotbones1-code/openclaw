@@ -143,13 +143,78 @@ function buildBrowserCommandGroups(params: {
   }));
 }
 
+const BROWSER_VALUE_OPTIONS = new Set(["--browser-profile", "--timeout", "--token", "--url"]);
+const BROWSER_BOOLEAN_OPTIONS = new Set(["--expect-final", "--json"]);
+const ROOT_VALUE_OPTIONS = new Set(["--container", "--log-level", "--profile"]);
+const ROOT_BOOLEAN_OPTIONS = new Set(["--dev", "--no-color"]);
+
+function optionHasInlineValue(token: string, options: ReadonlySet<string>): boolean {
+  for (const option of options) {
+    if (token.startsWith(`${option}=`)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function resolveBrowserSubcommand(argv: readonly string[]): string | null {
+  const args = argv.slice(2);
+  let browserIndex = -1;
+  for (let i = 0; i < args.length; i += 1) {
+    const token = args[i];
+    if (!token || token === "--") {
+      break;
+    }
+    if (ROOT_BOOLEAN_OPTIONS.has(token) || optionHasInlineValue(token, ROOT_VALUE_OPTIONS)) {
+      continue;
+    }
+    if (ROOT_VALUE_OPTIONS.has(token)) {
+      i += 1;
+      continue;
+    }
+    if (token === "browser") {
+      browserIndex = i;
+      break;
+    }
+    if (!token.startsWith("-")) {
+      break;
+    }
+  }
+  if (browserIndex < 0) {
+    return null;
+  }
+
+  for (let i = browserIndex + 1; i < args.length; i += 1) {
+    const token = args[i];
+    if (!token || token === "--") {
+      break;
+    }
+    if (BROWSER_VALUE_OPTIONS.has(token)) {
+      i += 1;
+      continue;
+    }
+    if (optionHasInlineValue(token, BROWSER_VALUE_OPTIONS)) {
+      continue;
+    }
+    if (BROWSER_BOOLEAN_OPTIONS.has(token)) {
+      continue;
+    }
+    if (token.startsWith("-")) {
+      continue;
+    }
+    return token;
+  }
+
+  return null;
+}
+
 function registerLazyBrowserCommands(
   browser: Command,
   parentOpts: (cmd: Command) => BrowserParentOpts,
   argv: string[],
 ) {
-  const { primary, commandPath } = resolveCliArgvInvocation(argv);
-  const subcommand = primary === "browser" ? (commandPath[1] ?? null) : null;
+  const { primary } = resolveCliArgvInvocation(argv);
+  const subcommand = primary === "browser" ? resolveBrowserSubcommand(argv) : null;
   registerCommandGroups(browser, buildBrowserCommandGroups({ browser, parentOpts }), {
     eager: shouldEagerRegisterSubcommands(),
     primary: subcommand,

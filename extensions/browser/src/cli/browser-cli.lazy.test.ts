@@ -89,6 +89,73 @@ describe("registerBrowserCli lazy browser subcommands", () => {
     expect(manageMocks.statusAction).toHaveBeenCalledTimes(1);
   });
 
+  it("registers the requested browser group when parent options precede the subcommand", async () => {
+    const program = new Command();
+    program.name("openclaw");
+
+    registerBrowserCli(program, [
+      "node",
+      "openclaw",
+      "browser",
+      "--browser-profile",
+      "titan-ig",
+      "status",
+    ]);
+
+    await program.parseAsync(["browser", "--browser-profile", "titan-ig", "status"], {
+      from: "user",
+    });
+
+    expect(manageMocks.registerBrowserManageCommands).toHaveBeenCalledTimes(1);
+    expect(inspectMocks.registerBrowserInspectCommands).not.toHaveBeenCalled();
+    expect(manageMocks.statusAction).toHaveBeenCalledTimes(1);
+  });
+
+  it("registers the requested browser group when parent options use equals syntax", async () => {
+    const program = new Command();
+    program.name("openclaw");
+
+    registerBrowserCli(program, [
+      "node",
+      "openclaw",
+      "browser",
+      "--browser-profile=titan-ig",
+      "status",
+    ]);
+
+    await program.parseAsync(["browser", "--browser-profile=titan-ig", "status"], {
+      from: "user",
+    });
+
+    expect(manageMocks.registerBrowserManageCommands).toHaveBeenCalledTimes(1);
+    expect(inspectMocks.registerBrowserInspectCommands).not.toHaveBeenCalled();
+    expect(manageMocks.statusAction).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not mistake root option values for browser subcommands", async () => {
+    const program = new Command();
+    program.name("openclaw");
+
+    registerBrowserCli(program, [
+      "node",
+      "openclaw",
+      "--profile",
+      "browser",
+      "browser",
+      "--browser-profile",
+      "titan-ig",
+      "status",
+    ]);
+
+    await program.parseAsync(["browser", "--browser-profile", "titan-ig", "status"], {
+      from: "user",
+    });
+
+    expect(manageMocks.registerBrowserManageCommands).toHaveBeenCalledTimes(1);
+    expect(inspectMocks.registerBrowserInspectCommands).not.toHaveBeenCalled();
+    expect(manageMocks.statusAction).toHaveBeenCalledTimes(1);
+  });
+
   it("loads browser doctor from the manage group so --deep is available", async () => {
     const program = new Command();
     program.name("openclaw");
