@@ -1054,6 +1054,81 @@ describe("dispatchCronDelivery — double-announce guard", () => {
     );
   });
 
+  it("briefs long text-only Telegram cron delivery while preserving report paths", async () => {
+    vi.mocked(countActiveDescendantRuns).mockReturnValue(0);
+    vi.mocked(isLikelyInterimCronMessage).mockReturnValue(false);
+
+    const params = makeBaseParams({
+      synthesizedText: [
+        "SHIPPED_UNIT",
+        "- Gate classifications fixed",
+        "- Stale gates removed",
+        "- Green unit executed",
+        "- Proof captured",
+        "- State updated",
+        "- Next automatic lane selected",
+        "Report: /Users/shamil/.openclaw/subagents/reports/sample-long-report.md",
+      ].join("\n"),
+    });
+    params.cfgWithAgentDefaults = {
+      cron: {
+        notifications: {
+          telegram: {
+            style: "brief",
+            maxLines: 5,
+            maxChars: 600,
+          },
+        },
+      },
+    } as never;
+
+    const state = await dispatchCronDelivery(params);
+
+    expect(state.result).toBeUndefined();
+    expect(state.delivered).toBe(true);
+    expect(deliverOutboundPayloads).toHaveBeenCalledTimes(1);
+    const deliveredPayloads = vi.mocked(deliverOutboundPayloads).mock.calls[0]?.[0]?.payloads;
+    expect(deliveredPayloads?.[0]?.text).toContain("OpenClaw: Test Job");
+    expect(deliveredPayloads?.[0]?.text).toContain("Result: SHIPPED_UNIT");
+    expect(deliveredPayloads?.[0]?.text).toContain(
+      "Report: /Users/shamil/.openclaw/subagents/reports/sample-long-report.md",
+    );
+    expect(deliveredPayloads?.[0]?.text?.split("\n").length).toBeLessThanOrEqual(5);
+  });
+
+  it("does not brief structured Telegram payloads", async () => {
+    vi.mocked(countActiveDescendantRuns).mockReturnValue(0);
+    vi.mocked(isLikelyInterimCronMessage).mockReturnValue(false);
+
+    const params = makeBaseParams({ synthesizedText: "SHIPPED_UNIT\n".repeat(20) });
+    params.cfgWithAgentDefaults = {
+      cron: { notifications: { telegram: { style: "brief" } } },
+    } as never;
+    params.deliveryPayloadHasStructuredContent = true;
+    params.deliveryPayloads = [
+      {
+        text: "SHIPPED_UNIT\n".repeat(20),
+        mediaUrl: "https://example.com/proof.png",
+      },
+    ] as never;
+
+    const state = await dispatchCronDelivery(params);
+
+    expect(state.result).toBeUndefined();
+    expect(state.delivered).toBe(true);
+    expect(deliverOutboundPayloads).toHaveBeenCalledTimes(1);
+    expect(deliverOutboundPayloads).toHaveBeenCalledWith(
+      expect.objectContaining({
+        payloads: [
+          {
+            text: "SHIPPED_UNIT\n".repeat(20),
+            mediaUrl: "https://example.com/proof.png",
+          },
+        ],
+      }),
+    );
+  });
+
   it("cleans up the direct cron session after structured direct delivery when deleteAfterRun is enabled", async () => {
     vi.mocked(countActiveDescendantRuns).mockReturnValue(0);
     vi.mocked(isLikelyInterimCronMessage).mockReturnValue(false);

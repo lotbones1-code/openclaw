@@ -58,4 +58,17 @@ export type CronConfig = {
   failureAlert?: CronFailureAlertConfig;
   /** Default destination for failure notifications across all cron jobs. */
   failureDestination?: CronFailureDestinationConfig;
+  /** Operator-facing cron notification preferences. */
+  notifications?: {
+    telegram?: {
+      /** Keep Telegram cron output compact while full details stay in report/run logs. */
+      style?: "default" | "brief";
+      /** Maximum delivered Telegram lines for brief cron notifications. Default: 6. */
+      maxLines?: number;
+      /** Maximum delivered Telegram characters for brief cron notifications. Default: 900. */
+      maxChars?: number;
+      /** Include discovered local report/proof paths in brief messages. Default: true. */
+      includeReportPaths?: boolean;
+    };
+  };
 };

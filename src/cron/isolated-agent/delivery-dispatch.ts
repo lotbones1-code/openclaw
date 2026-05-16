@@ -24,6 +24,7 @@ import {
   normalizeOptionalLowercaseString,
   normalizeOptionalString,
 } from "../../shared/string-coerce.js";
+import { applyCronTelegramBrevity } from "../notification-brevity.js";
 import { createCronExecutionId } from "../run-id.js";
 import { hasScheduledNextRunAtMs } from "../service/jobs.js";
 import type { CronJob, CronRunTelemetry } from "../types.js";
@@ -524,7 +525,12 @@ export async function dispatchCronDelivery(
           : synthesizedText
             ? [{ text: synthesizedText }]
             : [];
-      const payloadsForDelivery = rawPayloads
+      const payloadsForDelivery = applyCronTelegramBrevity({
+        cfg: params.cfgWithAgentDefaults,
+        job: params.job,
+        channel: delivery.channel,
+        payloads: rawPayloads,
+      })
         .map((p) => {
           if (!p.text) {
             return p;

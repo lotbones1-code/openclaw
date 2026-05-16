@@ -615,6 +615,20 @@ export const OpenClawSchema = z
           })
           .strict()
           .optional(),
+        notifications: z
+          .object({
+            telegram: z
+              .object({
+                style: z.enum(["default", "brief"]).optional(),
+                maxLines: z.number().int().min(3).max(20).optional(),
+                maxChars: z.number().int().min(240).max(4000).optional(),
+                includeReportPaths: z.boolean().optional(),
+              })
+              .strict()
+              .optional(),
+          })
+          .strict()
+          .optional(),
       })
       .strict()
       .superRefine((val, ctx) => {

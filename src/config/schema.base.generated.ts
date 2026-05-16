@@ -21019,6 +21019,35 @@ export const GENERATED_BASE_CONFIG_SCHEMA: BaseConfigSchemaResponse = {
             },
             additionalProperties: false,
           },
+          notifications: {
+            type: "object",
+            properties: {
+              telegram: {
+                type: "object",
+                properties: {
+                  style: {
+                    type: "string",
+                    enum: ["default", "brief"],
+                  },
+                  maxLines: {
+                    type: "integer",
+                    minimum: 3,
+                    maximum: 20,
+                  },
+                  maxChars: {
+                    type: "integer",
+                    minimum: 240,
+                    maximum: 4000,
+                  },
+                  includeReportPaths: {
+                    type: "boolean",
+                  },
+                },
+                additionalProperties: false,
+              },
+            },
+            additionalProperties: false,
+          },
         },
         additionalProperties: false,
         title: "Cron",
