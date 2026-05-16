@@ -255,6 +255,51 @@ describe("task-registry maintenance issue #60299", () => {
     });
   });
 
+  it("recovers finished cron tasks when the task run id drifts slightly from the durable run log", async () => {
+    const runLogStartedAt = Date.now() - GRACE_EXPIRED_MS;
+    const taskStartedAt = runLogStartedAt + 3;
+    const task = makeStaleTask({
+      runtime: "cron",
+      sourceId: "cron-job-run-log-drift",
+      runId: `cron:cron-job-run-log-drift:${taskStartedAt}`,
+      startedAt: taskStartedAt,
+      lastEventAt: taskStartedAt,
+    });
+
+    const { currentTasks } = createTaskRegistryMaintenanceHarness({
+      tasks: [task],
+      cronRunLogEntries: {
+        "cron-job-run-log-drift": [
+          {
+            ts: runLogStartedAt + 1250,
+            jobId: "cron-job-run-log-drift",
+            action: "finished",
+            status: "error",
+            error: "cron: job interrupted by gateway restart",
+            runAtMs: runLogStartedAt,
+            durationMs: 1250,
+          },
+        ],
+      },
+    });
+
+    expect(reconcileInspectableTasks()).toEqual([
+      expect.objectContaining({
+        taskId: task.taskId,
+        status: "failed",
+        endedAt: runLogStartedAt + 1250,
+        error: "cron: job interrupted by gateway restart",
+      }),
+    ]);
+    expect(previewTaskRegistryMaintenance()).toMatchObject({ reconciled: 0, recovered: 1 });
+    expect(await runTaskRegistryMaintenance()).toMatchObject({ reconciled: 0, recovered: 1 });
+    expect(currentTasks.get(task.taskId)).toMatchObject({
+      status: "failed",
+      endedAt: runLogStartedAt + 1250,
+      error: "cron: job interrupted by gateway restart",
+    });
+  });
+
   it("recovers interrupted cron tasks from durable cron job state when run logs are absent", async () => {
     const startedAt = Date.now() - GRACE_EXPIRED_MS;
     const task = makeStaleTask({

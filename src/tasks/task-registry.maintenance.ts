@@ -33,6 +33,7 @@ import type { TaskRecord, TaskRegistrySummary, TaskStatus } from "./task-registr
 const TASK_RECONCILE_GRACE_MS = 5 * 60_000;
 const TASK_RETENTION_MS = 7 * 24 * 60 * 60_000;
 const TASK_SWEEP_INTERVAL_MS = 60_000;
+const CRON_RUN_TIMESTAMP_DRIFT_MS = 1_000;
 
 /**
  * Number of tasks to process before yielding to the event loop.
@@ -186,6 +187,46 @@ function mapCronTerminalStatus(status: unknown, error?: string): CronTerminalRec
   return isTimeoutCronError(error) ? "timed_out" : "failed";
 }
 
+function isMatchingCronRunTimestamp(candidateAt: unknown, executionStartedAt: number): boolean {
+  return (
+    typeof candidateAt === "number" &&
+    Number.isFinite(candidateAt) &&
+    Math.abs(candidateAt - executionStartedAt) <= CRON_RUN_TIMESTAMP_DRIFT_MS
+  );
+}
+
+function selectMatchingCronRunLogEntry(
+  entries: CronRunLogEntry[],
+  execution: CronExecutionId,
+): CronRunLogEntry | undefined {
+  let selected: CronRunLogEntry | undefined;
+  let selectedDrift = Number.POSITIVE_INFINITY;
+  for (const candidate of entries) {
+    if (
+      candidate.jobId !== execution.jobId ||
+      candidate.action !== "finished" ||
+      !(
+        candidate.status === "ok" ||
+        candidate.status === "skipped" ||
+        candidate.status === "error"
+      ) ||
+      !isMatchingCronRunTimestamp(candidate.runAtMs, execution.startedAt)
+    ) {
+      continue;
+    }
+    const drift = Math.abs((candidate.runAtMs ?? execution.startedAt) - execution.startedAt);
+    if (
+      !selected ||
+      drift < selectedDrift ||
+      (drift === selectedDrift && candidate.ts >= selected.ts)
+    ) {
+      selected = candidate;
+      selectedDrift = drift;
+    }
+  }
+  return selected;
+}
+
 function getCronRunLogEntries(context: CronRecoveryContext, jobId: string): CronRunLogEntry[] {
   const cached = context.runLogsByJobId.get(jobId);
   if (cached) {
@@ -225,13 +266,7 @@ function resolveCronRunLogRecovery(
   context: CronRecoveryContext,
 ): CronTerminalRecovery | undefined {
   const entries = getCronRunLogEntries(context, execution.jobId);
-  const entry = entries.findLast(
-    (candidate) =>
-      candidate.jobId === execution.jobId &&
-      candidate.action === "finished" &&
-      candidate.runAtMs === execution.startedAt &&
-      (candidate.status === "ok" || candidate.status === "skipped" || candidate.status === "error"),
-  );
+  const entry = selectMatchingCronRunLogEntry(entries, execution);
   if (!entry) {
     return undefined;
   }
@@ -239,7 +274,11 @@ function resolveCronRunLogRecovery(
     typeof entry.durationMs === "number" && Number.isFinite(entry.durationMs)
       ? Math.max(0, entry.durationMs)
       : undefined;
-  const endedAt = durationMs === undefined ? entry.ts : execution.startedAt + durationMs;
+  const runAtMs =
+    typeof entry.runAtMs === "number" && Number.isFinite(entry.runAtMs)
+      ? entry.runAtMs
+      : execution.startedAt;
+  const endedAt = durationMs === undefined ? entry.ts : runAtMs + durationMs;
   return {
     status: mapCronTerminalStatus(entry.status, entry.error),
     endedAt,
@@ -255,7 +294,7 @@ function resolveCronJobStateRecovery(
 ): CronTerminalRecovery | undefined {
   const store = getCronStore(context);
   const job: CronJob | undefined = store?.jobs.find((entry) => entry.id === execution.jobId);
-  if (!job || job.state.lastRunAtMs !== execution.startedAt) {
+  if (!job || !isMatchingCronRunTimestamp(job.state.lastRunAtMs, execution.startedAt)) {
     return undefined;
   }
   const status = job.state.lastRunStatus ?? job.state.lastStatus;
@@ -266,7 +305,11 @@ function resolveCronJobStateRecovery(
     typeof job.state.lastDurationMs === "number" && Number.isFinite(job.state.lastDurationMs)
       ? Math.max(0, job.state.lastDurationMs)
       : 0;
-  const endedAt = execution.startedAt + durationMs;
+  const runAtMs =
+    typeof job.state.lastRunAtMs === "number" && Number.isFinite(job.state.lastRunAtMs)
+      ? job.state.lastRunAtMs
+      : execution.startedAt;
+  const endedAt = runAtMs + durationMs;
   return {
     status: mapCronTerminalStatus(status, job.state.lastError),
     endedAt,
