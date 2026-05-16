@@ -289,6 +289,81 @@ describe("cron service timer regressions", () => {
     );
   });
 
+  it("reconciles timeout-expired running markers before due collection", async () => {
+    const runningAt = Date.parse("2026-02-06T10:00:00.000Z");
+    const now = runningAt + 182_500;
+    const runIsolatedAgentJob = vi.fn(createDefaultIsolatedRunner());
+    const store = timerRegressionFixtures.makeStorePath();
+    const job = createIsolatedRegressionJob({
+      id: "timeout-expired-running-marker",
+      name: "timeout expired running marker",
+      scheduledAt: runningAt,
+      schedule: { kind: "every", everyMs: 60_000, anchorMs: runningAt - 60_000 },
+      payload: { kind: "agentTurn", message: "work", timeoutSeconds: 180 },
+      state: {
+        nextRunAtMs: runningAt,
+        runningAtMs: runningAt,
+      },
+    });
+    await writeCronJobs(store.storePath, [job]);
+    const state = createCronServiceState({
+      cronEnabled: true,
+      storePath: store.storePath,
+      log: noopLogger,
+      nowMs: () => now,
+      enqueueSystemEvent: vi.fn(),
+      requestHeartbeatNow: vi.fn(),
+      runIsolatedAgentJob,
+    });
+
+    await onTimer(state);
+
+    const updated = state.store?.jobs[0];
+    expect(runIsolatedAgentJob).not.toHaveBeenCalled();
+    expect(updated?.state.runningAtMs).toBeUndefined();
+    expect(updated?.state.lastStatus).toBe("error");
+    expect(updated?.state.lastError).toBe("cron: job execution timed out");
+    expect(updated?.state.lastRunAtMs).toBe(runningAt);
+    expect(updated?.state.consecutiveErrors).toBe(1);
+  });
+
+  it("auto-quarantines timeout-expired running markers that hit the timeout loop threshold", async () => {
+    const runningAt = Date.parse("2026-02-06T10:00:00.000Z");
+    const now = runningAt + 182_500;
+    const store = timerRegressionFixtures.makeStorePath();
+    const job = createIsolatedRegressionJob({
+      id: "timeout-expired-running-marker-loop",
+      name: "timeout expired running marker loop",
+      scheduledAt: runningAt,
+      schedule: { kind: "every", everyMs: 60_000, anchorMs: runningAt - 60_000 },
+      payload: { kind: "agentTurn", message: "work", timeoutSeconds: 180 },
+      state: {
+        nextRunAtMs: runningAt,
+        runningAtMs: runningAt,
+        consecutiveErrors: 2,
+      },
+    });
+    await writeCronJobs(store.storePath, [job]);
+    const state = createCronServiceState({
+      cronEnabled: true,
+      storePath: store.storePath,
+      log: noopLogger,
+      nowMs: () => now,
+      enqueueSystemEvent: vi.fn(),
+      requestHeartbeatNow: vi.fn(),
+      runIsolatedAgentJob: createDefaultIsolatedRunner(),
+    });
+
+    await onTimer(state);
+
+    const updated = state.store?.jobs[0];
+    expect(updated?.enabled).toBe(false);
+    expect(updated?.state.runningAtMs).toBeUndefined();
+    expect(updated?.state.nextRunAtMs).toBeUndefined();
+    expect(updated?.state.consecutiveErrors).toBe(3);
+    expect(updated?.state.lastError).toContain("auto-quarantined after 3 consecutive timeouts");
+  });
+
   it("#24355: one-shot job respects cron.retry config", async () => {
     const store = timerRegressionFixtures.makeStorePath();
     const scheduledAt = Date.parse("2026-02-06T10:00:00.000Z");

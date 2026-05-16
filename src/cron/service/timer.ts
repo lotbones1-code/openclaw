@@ -56,6 +56,7 @@ const DEFAULT_MAX_MISSED_JOBS_PER_RESTART = 5;
 const DEFAULT_FAILURE_ALERT_AFTER = 2;
 const DEFAULT_FAILURE_ALERT_COOLDOWN_MS = 60 * 60_000; // 1 hour
 const RECURRING_TIMEOUT_QUARANTINE_AFTER = 3;
+const RUNNING_MARKER_TIMEOUT_RECONCILE_GRACE_MS = 2_000;
 
 type ResolvedFailureAlert = {
   after: number;
@@ -192,6 +193,48 @@ function quarantineStoredRecurringTimeoutLoops(state: CronServiceState): boolean
     changed = true;
   }
   return changed;
+}
+
+function resolveTimeoutExpiredRunningOutcome(
+  job: CronJob,
+  nowMs: number,
+): TimedCronRunOutcome | undefined {
+  if (!isJobEnabled(job)) {
+    return undefined;
+  }
+  const runningAtMs = job.state.runningAtMs;
+  if (typeof runningAtMs !== "number" || !Number.isFinite(runningAtMs)) {
+    return undefined;
+  }
+  const timeoutMs = resolveCronJobTimeoutMs(job);
+  if (typeof timeoutMs !== "number" || !Number.isFinite(timeoutMs)) {
+    return undefined;
+  }
+  if (nowMs < runningAtMs + timeoutMs + RUNNING_MARKER_TIMEOUT_RECONCILE_GRACE_MS) {
+    return undefined;
+  }
+  return {
+    jobId: job.id,
+    taskRunId: createCronExecutionId(job.id, runningAtMs),
+    status: "error",
+    error: timeoutErrorMessage(),
+    startedAt: runningAtMs,
+    endedAt: nowMs,
+  };
+}
+
+function reconcileTimeoutExpiredRunningJobs(state: CronServiceState, nowMs: number): boolean {
+  const outcomes = (state.store?.jobs ?? [])
+    .map((job) => resolveTimeoutExpiredRunningOutcome(job, nowMs))
+    .filter((outcome): outcome is TimedCronRunOutcome => outcome !== undefined);
+  for (const outcome of outcomes) {
+    state.deps.log.warn(
+      { jobId: outcome.jobId, startedAt: outcome.startedAt, endedAt: outcome.endedAt },
+      "cron: reconciling timeout-expired running marker",
+    );
+    applyOutcomeToStoredJob(state, outcome);
+  }
+  return outcomes.length > 0;
 }
 
 function isAbortError(err: unknown): boolean {
@@ -822,8 +865,12 @@ export async function onTimer(state: CronServiceState) {
   try {
     const dueJobs = await locked(state, async () => {
       await ensureLoaded(state, { forceReload: true, skipRecompute: true });
-      const quarantinedStoredTimeoutLoops = quarantineStoredRecurringTimeoutLoops(state);
       const dueCheckNow = state.deps.nowMs();
+      const reconciledTimeoutExpiredRunning = reconcileTimeoutExpiredRunningJobs(
+        state,
+        dueCheckNow,
+      );
+      const quarantinedStoredTimeoutLoops = quarantineStoredRecurringTimeoutLoops(state);
       const due = collectRunnableJobs(state, dueCheckNow);
 
       if (due.length === 0) {
@@ -834,7 +881,7 @@ export async function onTimer(state: CronServiceState) {
           recomputeExpired: true,
           nowMs: dueCheckNow,
         });
-        if (quarantinedStoredTimeoutLoops || changed) {
+        if (reconciledTimeoutExpiredRunning || quarantinedStoredTimeoutLoops || changed) {
           await persist(state);
         }
         return [];
