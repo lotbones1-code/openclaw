@@ -1674,7 +1674,7 @@ function parseUsageCostRefreshWorkerResult(stdout: string): UsageCostRefreshResu
   const line = stdout
     .trim()
     .split(/\r?\n/u)
-    .reverse()
+    .toReversed()
     .find((candidate) => candidate.includes(USAGE_COST_REFRESH_WORKER_RESULT_MARKER));
   if (!line) {
     return null;
