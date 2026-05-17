@@ -8,11 +8,20 @@ import {
   __setGatewayModelPricingForTest,
 } from "../gateway/model-pricing-cache-state.js";
 import {
+  clearCurrentPluginMetadataSnapshot,
+  resolvePluginMetadataControlPlaneFingerprint,
+  setCurrentPluginMetadataSnapshot,
+} from "../plugins/current-plugin-metadata-snapshot.js";
+import { resolveInstalledPluginIndexPolicyHash } from "../plugins/installed-plugin-index-policy.js";
+import type { InstalledPluginIndex } from "../plugins/installed-plugin-index.js";
+import type { PluginMetadataSnapshot } from "../plugins/plugin-metadata-snapshot.js";
+import {
   __resetUsageFormatCachesForTest,
   estimateUsageCost,
   formatTokenCount,
   formatUsd,
   resolveModelCostConfig,
+  resolveModelCostConfigFingerprint,
   type PricingTier,
 } from "./usage-format.js";
 
@@ -36,6 +45,68 @@ function requireTieredPricing(
     throw new Error(`expected ${label} tiered pricing`);
   }
   return cost.tieredPricing;
+}
+
+function createModelNormalizationSnapshot(params: {
+  manifestHash: string;
+  aliasFrom: string;
+  aliasTo: string;
+}): PluginMetadataSnapshot {
+  const policyHash = resolveInstalledPluginIndexPolicyHash({});
+  const index: InstalledPluginIndex = {
+    version: 1,
+    hostContractVersion: "test-host",
+    compatRegistryVersion: "test-compat",
+    migrationVersion: 1,
+    policyHash,
+    generatedAtMs: 0,
+    installRecords: {},
+    plugins: [
+      {
+        pluginId: "normalizer",
+        manifestPath: `/tmp/normalizer-${params.manifestHash}/openclaw.plugin.json`,
+        manifestHash: params.manifestHash,
+        source: `/tmp/normalizer-${params.manifestHash}/index.ts`,
+        rootDir: `/tmp/normalizer-${params.manifestHash}`,
+        origin: "global",
+        enabled: true,
+        startup: {
+          sidecar: false,
+          memory: false,
+          deferConfiguredChannelFullLoadUntilAfterListen: false,
+          agentHarnesses: [],
+        },
+        compat: [],
+      },
+    ],
+    diagnostics: [],
+  };
+  return {
+    policyHash,
+    configFingerprint: resolvePluginMetadataControlPlaneFingerprint(
+      {},
+      {
+        env: process.env,
+        index,
+        policyHash,
+      },
+    ),
+    index,
+    plugins: [
+      {
+        id: "normalizer",
+        modelIdNormalization: {
+          providers: {
+            anthropic: {
+              aliases: {
+                [params.aliasFrom]: params.aliasTo,
+              },
+            },
+          },
+        },
+      },
+    ],
+  } as unknown as PluginMetadataSnapshot;
 }
 
 describe("usage-format", () => {
@@ -67,6 +138,7 @@ describe("usage-format", () => {
     }
     __resetUsageFormatCachesForTest();
     __resetGatewayModelPricingCacheForTest();
+    clearCurrentPluginMetadataSnapshot();
     await fs.rm(stateDir, { recursive: true, force: true });
   });
 
@@ -286,6 +358,90 @@ describe("usage-format", () => {
       cacheRead: 0.7,
       cacheWrite: 0.8,
     });
+  });
+
+  it("can skip manifest-backed model normalization for worker-safe cost lookup", () => {
+    setCurrentPluginMetadataSnapshot(
+      createModelNormalizationSnapshot({
+        manifestHash: "alpha",
+        aliasFrom: "sonnet-4.6",
+        aliasTo: "claude-sonnet-4-6",
+      }),
+      { config: {}, env: process.env },
+    );
+    const config = {
+      models: {
+        providers: {
+          anthropic: {
+            models: [
+              {
+                id: "sonnet-4.6",
+                cost: { input: 7, output: 8, cacheRead: 0.7, cacheWrite: 0.8 },
+              },
+            ],
+          },
+        },
+      },
+    } as unknown as OpenClawConfig;
+
+    const defaultFingerprint = resolveModelCostConfigFingerprint(config);
+    const workerSafeFingerprint = resolveModelCostConfigFingerprint(config, {
+      allowManifestNormalization: false,
+      allowPluginNormalization: false,
+    });
+
+    setCurrentPluginMetadataSnapshot(
+      createModelNormalizationSnapshot({
+        manifestHash: "bravo",
+        aliasFrom: "sonnet-4.6",
+        aliasTo: "claude-sonnet-4-7",
+      }),
+      { config: {}, env: process.env },
+    );
+
+    expect(resolveModelCostConfigFingerprint(config)).not.toBe(defaultFingerprint);
+    expect(
+      resolveModelCostConfigFingerprint(config, {
+        allowManifestNormalization: false,
+        allowPluginNormalization: false,
+      }),
+    ).toBe(workerSafeFingerprint);
+    expect(
+      resolveModelCostConfig({
+        provider: "anthropic",
+        model: "sonnet-4.6",
+        config,
+        allowManifestNormalization: false,
+        allowPluginNormalization: false,
+      }),
+    ).toEqual({
+      input: 7,
+      output: 8,
+      cacheRead: 0.7,
+      cacheWrite: 0.8,
+    });
+
+    __setGatewayModelPricingForTest([
+      {
+        provider: "anthropic",
+        model: "claude-sonnet-4-7",
+        pricing: { input: 2, output: 3, cacheRead: 0.2, cacheWrite: 0.3 },
+      },
+    ]);
+    expect(resolveModelCostConfig({ provider: "anthropic", model: "sonnet-4.6" })).toEqual({
+      input: 2,
+      output: 3,
+      cacheRead: 0.2,
+      cacheWrite: 0.3,
+    });
+    expect(
+      resolveModelCostConfig({
+        provider: "anthropic",
+        model: "sonnet-4.6",
+        allowManifestNormalization: false,
+        allowPluginNormalization: false,
+      }),
+    ).toBeUndefined();
   });
 
   // -----------------------------------------------------------------------

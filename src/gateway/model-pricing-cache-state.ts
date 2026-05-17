@@ -20,6 +20,11 @@ export type CachedModelPricing = {
   tieredPricing?: CachedPricingTier[];
 };
 
+export type GatewayModelPricingCacheSnapshot = {
+  cachedAt: number;
+  entries: Array<[string, CachedModelPricing]>;
+};
+
 export type GatewayModelPricingHealthSource = "openrouter" | "litellm" | "bootstrap" | "refresh";
 
 export type GatewayModelPricingHealth = {
@@ -60,6 +65,44 @@ export function replaceGatewayModelPricingCache(
 ): void {
   cachedPricing = nextPricing;
   cachedAt = nextCachedAt;
+}
+
+function cloneCachedModelPricing(pricing: CachedModelPricing): CachedModelPricing {
+  return {
+    input: pricing.input,
+    output: pricing.output,
+    cacheRead: pricing.cacheRead,
+    cacheWrite: pricing.cacheWrite,
+    ...(pricing.tieredPricing
+      ? {
+          tieredPricing: pricing.tieredPricing.map((tier) => ({
+            input: tier.input,
+            output: tier.output,
+            cacheRead: tier.cacheRead,
+            cacheWrite: tier.cacheWrite,
+            range: [tier.range[0], tier.range[1]] as [number, number],
+          })),
+        }
+      : {}),
+  };
+}
+
+export function snapshotGatewayModelPricingCache(): GatewayModelPricingCacheSnapshot {
+  return {
+    cachedAt,
+    entries: Array.from(cachedPricing.entries())
+      .toSorted(([a], [b]) => a.localeCompare(b))
+      .map(([key, pricing]) => [key, cloneCachedModelPricing(pricing)]),
+  };
+}
+
+export function hydrateGatewayModelPricingCacheFromSnapshot(
+  snapshot: GatewayModelPricingCacheSnapshot,
+): void {
+  replaceGatewayModelPricingCache(
+    new Map(snapshot.entries.map(([key, pricing]) => [key, cloneCachedModelPricing(pricing)])),
+    snapshot.cachedAt,
+  );
 }
 
 export function clearGatewayModelPricingCacheState(): void {
@@ -123,6 +166,8 @@ export function getGatewayModelPricingHealth(params?: {
 export function getCachedGatewayModelPricing(params: {
   provider?: string;
   model?: string;
+  allowManifestNormalization?: boolean;
+  allowPluginNormalization?: boolean;
 }): CachedModelPricing | undefined {
   const provider = params.provider?.trim();
   const model = params.model?.trim();
@@ -134,7 +179,10 @@ export function getCachedGatewayModelPricing(params: {
   if (direct) {
     return direct;
   }
-  const normalized = normalizeModelRef(provider, model);
+  const normalized = normalizeModelRef(provider, model, {
+    allowManifestNormalization: params.allowManifestNormalization,
+    allowPluginNormalization: params.allowPluginNormalization ?? false,
+  });
   const normalizedKey = modelPricingCacheKey(normalized.provider, normalized.model);
   if (normalizedKey === key) {
     return undefined;

@@ -1,6 +1,9 @@
+import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import readline from "node:readline";
+import { setImmediate as setImmediatePromise } from "node:timers/promises";
+import { fileURLToPath } from "node:url";
 import type { NormalizedUsage, UsageLike } from "../agents/usage.js";
 import { normalizeUsage } from "../agents/usage.js";
 import { stripInboundMetadata } from "../auto-reply/reply/strip-inbound-meta.js";
@@ -17,6 +20,10 @@ import {
 } from "../config/sessions/paths.js";
 import type { SessionEntry } from "../config/sessions/types.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
+import {
+  snapshotGatewayModelPricingCache,
+  type GatewayModelPricingCacheSnapshot,
+} from "../gateway/model-pricing-cache-state.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
 import { stripEnvelope, stripMessageIdHints } from "../shared/chat-envelope.js";
 import { asFiniteNumber } from "../shared/number-coercion.js";
@@ -24,6 +31,7 @@ import { normalizeOptionalString } from "../shared/string-coerce.js";
 import { countToolResults, extractToolCallNames } from "../utils/transcript-tools.js";
 import {
   estimateUsageCost,
+  type ModelCostConfig,
   resolveModelCostConfig,
   resolveModelCostConfigFingerprint,
 } from "../utils/usage-format.js";
@@ -95,9 +103,72 @@ type UsageCostRefreshState = {
   timer?: ReturnType<typeof setTimeout>;
 };
 
-type UsageCostRefreshResult = "refreshed" | "busy";
+export type UsageCostRefreshResult = "refreshed" | "partial" | "busy";
+
+export type UsageCostRefreshParams = {
+  config?: OpenClawConfig;
+  agentId?: string;
+  gatewayModelPricingCache?: GatewayModelPricingCacheSnapshot;
+  maxFiles?: number;
+  sessionFiles?: string[];
+  startMs?: number;
+};
 
 const usageCostRefreshes = new Map<string, UsageCostRefreshState>();
+const USAGE_COST_SCAN_YIELD_EVERY_RECORDS = 100;
+const USAGE_COST_BACKGROUND_REFRESH_MAX_FILES = 1;
+const USAGE_COST_REFRESH_WORKER_OUTPUT_LIMIT = 8192;
+const USAGE_COST_REFRESH_WORKER_RESULT_MARKER = "openclawUsageCostRefresh";
+const USAGE_COST_REFRESH_NON_FINITE_NUMBER_MARKER = "__openclawUsageCostRefreshNonFiniteNumber";
+
+function serializeUsageCostRefreshValue(_key: string, value: unknown): unknown {
+  if (typeof value === "number" && !Number.isFinite(value)) {
+    return {
+      [USAGE_COST_REFRESH_NON_FINITE_NUMBER_MARKER]: Number.isNaN(value)
+        ? "NaN"
+        : value > 0
+          ? "Infinity"
+          : "-Infinity",
+    };
+  }
+  return value;
+}
+
+function parseUsageCostRefreshValue(_key: string, value: unknown): unknown {
+  if (!value || typeof value !== "object") {
+    return value;
+  }
+  const record = value as Record<string, unknown>;
+  const marker = record[USAGE_COST_REFRESH_NON_FINITE_NUMBER_MARKER];
+  if (Object.keys(record).length !== 1 || typeof marker !== "string") {
+    return value;
+  }
+  if (marker === "Infinity") {
+    return Infinity;
+  }
+  if (marker === "-Infinity") {
+    return -Infinity;
+  }
+  if (marker === "NaN") {
+    return Number.NaN;
+  }
+  return value;
+}
+
+export function stringifyUsageCostRefreshParams(params: UsageCostRefreshParams): string {
+  return JSON.stringify(params, serializeUsageCostRefreshValue);
+}
+
+export function parseUsageCostRefreshParams(raw: string): UsageCostRefreshParams {
+  if (!raw.trim()) {
+    return {};
+  }
+  const parsed = JSON.parse(raw, parseUsageCostRefreshValue) as unknown;
+  if (!parsed || typeof parsed !== "object") {
+    return {};
+  }
+  return parsed as UsageCostRefreshParams;
+}
 
 type UsageCostCachedUsageEntry = CostUsageTotals & {
   timestamp: number;
@@ -184,7 +255,10 @@ const addTotals = (target: CostUsageTotals, source: CostUsageTotals): void => {
 };
 
 function resolveUsageCostPricingFingerprint(config?: OpenClawConfig): string {
-  return resolveModelCostConfigFingerprint(config);
+  return resolveModelCostConfigFingerprint(config, {
+    allowManifestNormalization: false,
+    allowPluginNormalization: false,
+  });
 }
 
 function resolveUsageCostCachePath(agentId?: string): string {
@@ -380,6 +454,36 @@ async function listUsageCountedTranscriptFiles(
       }),
   );
   return files.filter((file): file is UsageCostTranscriptFile => Boolean(file));
+}
+
+async function expandExistingFilePathSet(filePaths: readonly string[]): Promise<Set<string>> {
+  const expanded = new Set<string>();
+  for (const filePath of filePaths) {
+    expanded.add(filePath);
+    expanded.add(await fs.promises.realpath(filePath).catch(() => filePath));
+  }
+  return expanded;
+}
+
+async function findUsageCostCacheEntryForSessionFile(
+  cache: UsageCostCacheFile,
+  sessionFile: string,
+): Promise<{ cacheKey: string; entry: UsageCostCacheFileEntry | undefined }> {
+  const direct = cache.files[sessionFile];
+  if (direct) {
+    return { cacheKey: sessionFile, entry: direct };
+  }
+  const sessionPaths = await expandExistingFilePathSet([sessionFile]);
+  for (const [cacheKey, entry] of Object.entries(cache.files)) {
+    if (sessionPaths.has(cacheKey)) {
+      return { cacheKey, entry };
+    }
+    const realCacheKey = await fs.promises.realpath(cacheKey).catch(() => cacheKey);
+    if (sessionPaths.has(realCacheKey)) {
+      return { cacheKey, entry };
+    }
+  }
+  return { cacheKey: sessionFile, entry: undefined };
 }
 
 function isUsageCostCacheEntryFresh(params: {
@@ -1076,6 +1180,25 @@ async function scanTranscriptFile(params: {
   endOffset?: number;
   onEntry: (entry: ParsedTranscriptEntry) => void;
 }): Promise<void> {
+  let scannedRecords = 0;
+  const modelCostCache = new Map<string, ModelCostConfig | null>();
+  const resolveEntryCost = (entry: ParsedTranscriptEntry): ModelCostConfig | undefined => {
+    const key = `${entry.provider ?? ""}\u0000${entry.model ?? ""}`;
+    const cached = modelCostCache.get(key);
+    if (cached !== undefined) {
+      return cached ?? undefined;
+    }
+    const cost =
+      resolveModelCostConfig({
+        provider: entry.provider,
+        model: entry.model,
+        config: params.config,
+        allowManifestNormalization: false,
+        allowPluginNormalization: false,
+      }) ?? null;
+    modelCostCache.set(key, cost);
+    return cost ?? undefined;
+  };
   for await (const parsed of readJsonlRecords(
     params.filePath,
     params.startOffset,
@@ -1087,11 +1210,7 @@ async function scanTranscriptFile(params: {
     }
 
     if (entry.usage) {
-      const cost = resolveModelCostConfig({
-        provider: entry.provider,
-        model: entry.model,
-        config: params.config,
-      });
+      const cost = resolveEntryCost(entry);
       if (cost?.tieredPricing && cost.tieredPricing.length > 0) {
         // When tiered pricing is configured, always recompute to override
         // the flat-rate cost that the transport layer wrote into the transcript.
@@ -1106,6 +1225,10 @@ async function scanTranscriptFile(params: {
     }
 
     params.onEntry(entry);
+    scannedRecords += 1;
+    if (scannedRecords % USAGE_COST_SCAN_YIELD_EVERY_RECORDS === 0) {
+      await setImmediatePromise();
+    }
   }
 }
 
@@ -1438,13 +1561,9 @@ async function scanUsageFileForCache(params: {
   };
 }
 
-export async function refreshCostUsageCache(params?: {
-  config?: OpenClawConfig;
-  agentId?: string;
-  maxFiles?: number;
-  sessionFiles?: string[];
-  startMs?: number;
-}): Promise<UsageCostRefreshResult> {
+export async function refreshCostUsageCache(
+  params?: UsageCostRefreshParams,
+): Promise<UsageCostRefreshResult> {
   const cachePath = resolveUsageCostCachePath(params?.agentId);
   const lock = await acquireUsageCostCacheRefreshLock(cachePath);
   if (!lock.acquired) {
@@ -1454,14 +1573,23 @@ export async function refreshCostUsageCache(params?: {
     const pricingFingerprint = resolveUsageCostPricingFingerprint(params?.config);
     const cache = await readUsageCostCache(cachePath);
     const files = await listUsageCountedTranscriptFiles(params?.agentId);
-    const sessionSummaryFiles = new Set(params?.sessionFiles ?? []);
+    const requestedSessionFiles = await expandExistingFilePathSet(params?.sessionFiles ?? []);
     const refreshStartMs = params?.startMs;
-    const refreshFiles =
-      sessionSummaryFiles.size > 0
-        ? files.filter((file) => sessionSummaryFiles.has(file.filePath))
-        : refreshStartMs === undefined
-          ? files
-          : files.filter((file) => file.mtimeMs >= refreshStartMs);
+    const refreshFiles: UsageCostTranscriptFile[] = [];
+    for (const file of files) {
+      if (requestedSessionFiles.size > 0) {
+        const realPath = await fs.promises.realpath(file.filePath).catch(() => file.filePath);
+        if (!requestedSessionFiles.has(file.filePath) && !requestedSessionFiles.has(realPath)) {
+          continue;
+        }
+      } else if (refreshStartMs !== undefined && file.mtimeMs < refreshStartMs) {
+        continue;
+      }
+      refreshFiles.push(file);
+    }
+    const sessionSummaryFiles = new Set(
+      params?.sessionFiles ? refreshFiles.map((file) => file.filePath) : [],
+    );
     const livePaths = new Set(files.map((file) => file.filePath));
     for (const filePath of Object.keys(cache.files)) {
       if (!livePaths.has(filePath)) {
@@ -1478,15 +1606,15 @@ export async function refreshCostUsageCache(params?: {
       files: refreshFiles,
       pricingFingerprint,
       sessionSummaryFiles,
-    })
-      .toSorted((a, b) => {
-        const aSession = sessionSummaryFiles.has(a.filePath) ? 0 : 1;
-        const bSession = sessionSummaryFiles.has(b.filePath) ? 0 : 1;
-        return aSession - bSession || a.size - b.size || a.filePath.localeCompare(b.filePath);
-      })
-      .slice(0, maxFiles);
+    }).toSorted((a, b) => {
+      const aSession = sessionSummaryFiles.has(a.filePath) ? 0 : 1;
+      const bSession = sessionSummaryFiles.has(b.filePath) ? 0 : 1;
+      return aSession - bSession || a.size - b.size || a.filePath.localeCompare(b.filePath);
+    });
+    const selectedStaleFiles = staleFiles.slice(0, maxFiles);
 
-    for (const file of staleFiles) {
+    for (const file of selectedStaleFiles) {
+      await setImmediatePromise();
       cache.files[file.filePath] = await scanUsageFileForCache({
         file,
         config: params?.config,
@@ -1495,14 +1623,113 @@ export async function refreshCostUsageCache(params?: {
       });
       cache.updatedAt = Date.now();
       await writeUsageCostCache(cachePath, cache);
+      await setImmediatePromise();
     }
 
     cache.updatedAt = Date.now();
     await writeUsageCostCache(cachePath, cache);
-    return "refreshed";
+    return selectedStaleFiles.length < staleFiles.length ? "partial" : "refreshed";
   } finally {
     await lock.release();
   }
+}
+
+function isUsageCostRefreshWorkerEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const raw = env.OPENCLAW_USAGE_COST_REFRESH_WORKER?.trim().toLowerCase();
+  if (raw === "0" || raw === "false" || raw === "off") {
+    return false;
+  }
+  if (raw === "1" || raw === "true" || raw === "on") {
+    return true;
+  }
+  if (env.OPENCLAW_USAGE_COST_REFRESH_WORKER_CHILD === "1") {
+    return false;
+  }
+  return !env.VITEST && env.NODE_ENV !== "test";
+}
+
+function appendLimitedOutput(current: string, chunk: unknown): string {
+  return `${current}${String(chunk)}`.slice(-USAGE_COST_REFRESH_WORKER_OUTPUT_LIMIT);
+}
+
+function resolveUsageCostRefreshWorkerPath(): string {
+  const currentPath = fileURLToPath(import.meta.url);
+  const extension = path.extname(currentPath) || ".js";
+  const fileName = `session-cost-usage.worker${extension}`;
+  const baseDir = path.dirname(currentPath);
+  const candidates = [path.join(baseDir, fileName), path.join(baseDir, "infra", fileName)];
+  return candidates.find((candidate) => fs.existsSync(candidate)) ?? candidates[0];
+}
+
+function buildUsageCostRefreshWorkerArgs(workerPath: string): string[] {
+  const extension = path.extname(workerPath);
+  const bunVersion = (process.versions as Record<string, string | undefined>).bun;
+  if ((extension === ".ts" || extension === ".tsx") && !bunVersion) {
+    return ["--import", "tsx", workerPath];
+  }
+  return [workerPath];
+}
+
+function parseUsageCostRefreshWorkerResult(stdout: string): UsageCostRefreshResult | null {
+  const line = stdout
+    .trim()
+    .split(/\r?\n/u)
+    .reverse()
+    .find((candidate) => candidate.includes(USAGE_COST_REFRESH_WORKER_RESULT_MARKER));
+  if (!line) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(line) as Record<string, unknown>;
+    const result = parsed.result;
+    return result === "refreshed" || result === "partial" || result === "busy" ? result : null;
+  } catch {
+    return null;
+  }
+}
+
+async function refreshCostUsageCacheInWorker(
+  params?: UsageCostRefreshParams,
+): Promise<UsageCostRefreshResult> {
+  const workerPath = resolveUsageCostRefreshWorkerPath();
+  const workerParams: UsageCostRefreshParams = {
+    ...params,
+    gatewayModelPricingCache: snapshotGatewayModelPricingCache(),
+  };
+  const child = spawn(process.execPath, buildUsageCostRefreshWorkerArgs(workerPath), {
+    env: {
+      ...process.env,
+      OPENCLAW_USAGE_COST_REFRESH_WORKER_CHILD: "1",
+    },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+
+  let stdout = "";
+  let stderr = "";
+  child.stdout?.setEncoding("utf-8");
+  child.stderr?.setEncoding("utf-8");
+  child.stdout?.on("data", (chunk) => {
+    stdout = appendLimitedOutput(stdout, chunk);
+  });
+  child.stderr?.on("data", (chunk) => {
+    stderr = appendLimitedOutput(stderr, chunk);
+  });
+
+  child.stdin?.end(stringifyUsageCostRefreshParams(workerParams));
+
+  return await new Promise<UsageCostRefreshResult>((resolve, reject) => {
+    child.once("error", reject);
+    child.once("close", (code, signal) => {
+      const result = parseUsageCostRefreshWorkerResult(stdout);
+      if (code === 0 && result) {
+        resolve(result);
+        return;
+      }
+      const detail =
+        stderr.trim() || stdout.trim() || `exit=${code ?? "null"} signal=${signal ?? "null"}`;
+      reject(new Error(`usage cost refresh worker failed: ${detail}`));
+    });
+  });
 }
 
 export async function loadCostUsageSummaryFromCache(params: {
@@ -1585,12 +1812,12 @@ export async function loadSessionCostSummaryFromCache(params: {
   let file = stats
     ? { filePath: params.sessionFile, size: stats.size, mtimeMs: stats.mtimeMs }
     : undefined;
-  let entry = cache.files[params.sessionFile];
+  let { cacheKey, entry } = await findUsageCostCacheEntryForSessionFile(cache, params.sessionFile);
   let stale =
     !file ||
     !isUsageCostCacheEntryFresh({
       entry,
-      file,
+      file: { ...file, filePath: cacheKey },
       pricingFingerprint,
       requireSessionSummary: true,
     });
@@ -1610,12 +1837,15 @@ export async function loadSessionCostSummaryFromCache(params: {
         file = stats
           ? { filePath: params.sessionFile, size: stats.size, mtimeMs: stats.mtimeMs }
           : undefined;
-        entry = cache.files[params.sessionFile];
+        ({ cacheKey, entry } = await findUsageCostCacheEntryForSessionFile(
+          cache,
+          params.sessionFile,
+        ));
         stale =
           !file ||
           !isUsageCostCacheEntryFresh({
             entry,
-            file,
+            file: { ...file, filePath: cacheKey },
             pricingFingerprint,
             requireSessionSummary: true,
           });
@@ -1770,10 +2000,14 @@ async function runQueuedUsageCostRefresh(
         state.pendingSessionFiles.clear();
       }
       state.fullRefreshRequested = false;
-      const result = await refreshCostUsageCache({
+      const refresh = isUsageCostRefreshWorkerEnabled()
+        ? refreshCostUsageCacheInWorker
+        : refreshCostUsageCache;
+      const result = await refresh({
         config: state.config,
         agentId: state.agentId,
         sessionFiles: fullRefreshRequested ? undefined : sessionFiles,
+        maxFiles: USAGE_COST_BACKGROUND_REFRESH_MAX_FILES,
       });
       if (result === "busy") {
         if (fullRefreshRequested) {
@@ -1784,6 +2018,17 @@ async function runQueuedUsageCostRefresh(
           }
         }
         retryDelayMs = 50;
+        break;
+      }
+      if (result === "partial") {
+        if (fullRefreshRequested) {
+          state.fullRefreshRequested = true;
+        } else {
+          for (const sessionFile of sessionFiles) {
+            state.pendingSessionFiles.add(sessionFile);
+          }
+        }
+        retryDelayMs = 0;
         break;
       }
     }

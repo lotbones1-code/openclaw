@@ -5,8 +5,10 @@ import { modelKey, normalizeModelRef, normalizeProviderId } from "../agents/mode
 import type { NormalizedUsage } from "../agents/usage.js";
 import type { ModelProviderConfig } from "../config/types.models.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
-import { getGatewayModelPricingCacheFingerprint } from "../gateway/model-pricing-cache-state.js";
-import { getCachedGatewayModelPricing } from "../gateway/model-pricing-cache.js";
+import {
+  getCachedGatewayModelPricing,
+  getGatewayModelPricingCacheFingerprint,
+} from "../gateway/model-pricing-cache-state.js";
 import { tryReadJsonSync } from "../infra/json-files.js";
 import { normalizeOptionalString } from "../shared/string-coerce.js";
 
@@ -100,6 +102,7 @@ export function formatUsd(value?: number): string | undefined {
 function toResolvedModelKey(params: {
   provider?: string;
   model?: string;
+  allowManifestNormalization?: boolean;
   allowPluginNormalization?: boolean;
 }): string | null {
   const provider = normalizeOptionalString(params.provider);
@@ -108,6 +111,7 @@ function toResolvedModelKey(params: {
     return null;
   }
   const normalized = normalizeModelRef(provider, model, {
+    allowManifestNormalization: params.allowManifestNormalization,
     allowPluginNormalization: params.allowPluginNormalization,
   });
   return modelKey(normalized.provider, normalized.model);
@@ -174,7 +178,7 @@ function normalizeTieredPricing(raw: RawPricingTier[] | undefined): PricingTier[
 
 function buildProviderCostIndex(
   providers: Record<string, ModelProviderConfig> | undefined,
-  options?: { allowPluginNormalization?: boolean },
+  options?: { allowManifestNormalization?: boolean; allowPluginNormalization?: boolean },
 ): Map<string, ModelCostConfig> {
   const entries = new Map<string, ModelCostConfig>();
   if (!providers) {
@@ -184,6 +188,7 @@ function buildProviderCostIndex(
     const normalizedProvider = normalizeProviderId(providerKey);
     for (const model of providerConfig?.models ?? []) {
       const normalized = normalizeModelRef(normalizedProvider, model.id, {
+        allowManifestNormalization: options?.allowManifestNormalization,
         allowPluginNormalization: options?.allowPluginNormalization,
       });
       const cost = { ...model.cost };
@@ -202,6 +207,7 @@ function buildProviderCostIndex(
 }
 
 function loadModelsJsonCostIndex(options?: {
+  allowManifestNormalization?: boolean;
   allowPluginNormalization?: boolean;
 }): Map<string, ModelCostConfig> {
   const useRawEntries = options?.allowPluginNormalization === false;
@@ -227,6 +233,7 @@ function loadModelsJsonCostIndex(options?: {
 
     if (useRawEntries) {
       modelsJsonCostCache.rawEntries ??= buildProviderCostIndex(modelsJsonCostCache.providers, {
+        allowManifestNormalization: false,
         allowPluginNormalization: false,
       });
       return modelsJsonCostCache.rawEntries;
@@ -251,6 +258,7 @@ function findConfiguredProviderCost(params: {
   provider?: string;
   model?: string;
   config?: OpenClawConfig;
+  allowManifestNormalization?: boolean;
   allowPluginNormalization?: boolean;
 }): ModelCostConfig | undefined {
   const key = toResolvedModelKey(params);
@@ -258,6 +266,7 @@ function findConfiguredProviderCost(params: {
     return undefined;
   }
   return buildProviderCostIndex(params.config?.models?.providers, {
+    allowManifestNormalization: params.allowManifestNormalization,
     allowPluginNormalization: params.allowPluginNormalization,
   }).get(key);
 }
@@ -286,14 +295,34 @@ function serializeCostIndex(
   return Array.from(entries.entries()).toSorted(([a], [b]) => a.localeCompare(b));
 }
 
-export function resolveModelCostConfigFingerprint(config?: OpenClawConfig): string {
+export function resolveModelCostConfigFingerprint(
+  config?: OpenClawConfig,
+  options?: { allowManifestNormalization?: boolean; allowPluginNormalization?: boolean },
+): string {
+  const allowManifestNormalization = options?.allowManifestNormalization;
+  const allowPluginNormalization = options?.allowPluginNormalization;
   return stableCostFingerprintValue({
     configuredRaw: serializeCostIndex(
-      buildProviderCostIndex(config?.models?.providers, { allowPluginNormalization: false }),
+      buildProviderCostIndex(config?.models?.providers, {
+        allowManifestNormalization: false,
+        allowPluginNormalization: false,
+      }),
     ),
-    configuredNormalized: serializeCostIndex(buildProviderCostIndex(config?.models?.providers)),
-    modelsJsonRaw: serializeCostIndex(loadModelsJsonCostIndex({ allowPluginNormalization: false })),
-    modelsJsonNormalized: serializeCostIndex(loadModelsJsonCostIndex()),
+    configuredNormalized: serializeCostIndex(
+      buildProviderCostIndex(config?.models?.providers, {
+        allowManifestNormalization,
+        allowPluginNormalization,
+      }),
+    ),
+    modelsJsonRaw: serializeCostIndex(
+      loadModelsJsonCostIndex({
+        allowManifestNormalization: false,
+        allowPluginNormalization: false,
+      }),
+    ),
+    modelsJsonNormalized: serializeCostIndex(
+      loadModelsJsonCostIndex({ allowManifestNormalization, allowPluginNormalization }),
+    ),
     gatewayPricing: getGatewayModelPricingCacheFingerprint(),
   });
 }
@@ -302,6 +331,7 @@ export function resolveModelCostConfig(params: {
   provider?: string;
   model?: string;
   config?: OpenClawConfig;
+  allowManifestNormalization?: boolean;
   allowPluginNormalization?: boolean;
 }): ModelCostConfig | undefined {
   const rawKey = toDirectModelKey(params);
@@ -312,6 +342,7 @@ export function resolveModelCostConfig(params: {
   // Favor direct configured keys first so local pricing/status lookups stay
   // synchronous and do not drag plugin/provider discovery into the hot path.
   const rawModelsJsonCost = loadModelsJsonCostIndex({
+    allowManifestNormalization: false,
     allowPluginNormalization: false,
   }).get(rawKey);
   if (rawModelsJsonCost) {
@@ -320,6 +351,7 @@ export function resolveModelCostConfig(params: {
 
   const rawConfiguredCost = findConfiguredProviderCost({
     ...params,
+    allowManifestNormalization: false,
     allowPluginNormalization: false,
   });
   if (rawConfiguredCost) {
@@ -327,7 +359,11 @@ export function resolveModelCostConfig(params: {
   }
 
   if (params.allowPluginNormalization === false) {
-    return undefined;
+    return getCachedGatewayModelPricing({
+      ...params,
+      allowManifestNormalization: params.allowManifestNormalization,
+      allowPluginNormalization: params.allowPluginNormalization,
+    });
   }
 
   if (shouldUseNormalizedCostLookup(params)) {

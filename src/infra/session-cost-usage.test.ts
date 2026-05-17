@@ -587,6 +587,69 @@ describe("session cost usage", () => {
     });
   });
 
+  it("preserves gateway pricing cache state across background worker refreshes", async () => {
+    const root = await makeSessionCostRoot("cost-cache-worker-gateway-pricing");
+    const sessionsDir = path.join(root, "agents", "main", "sessions");
+    await fs.mkdir(sessionsDir, { recursive: true });
+    await fs.writeFile(
+      path.join(sessionsDir, "sess-cache-worker-gateway-pricing.jsonl"),
+      transcriptText("sess-cache-worker-gateway-pricing", {
+        type: "message",
+        timestamp: "2026-02-05T12:00:00.000Z",
+        message: {
+          role: "assistant",
+          provider: "openai",
+          model: "gpt-5.4",
+          usage: {
+            input: 1000,
+            output: 1000,
+            totalTokens: 2000,
+          },
+        },
+      }),
+      "utf-8",
+    );
+
+    await withEnvAsync(
+      { OPENCLAW_STATE_DIR: root, OPENCLAW_USAGE_COST_REFRESH_WORKER: "1" },
+      async () => {
+        try {
+          __setGatewayModelPricingForTest([
+            {
+              provider: "openai",
+              model: "gpt-5.4",
+              pricing: {
+                input: 1,
+                output: 1,
+                cacheRead: 0,
+                cacheWrite: 0,
+                tieredPricing: [
+                  { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, range: [0, Infinity] },
+                ],
+              },
+            },
+          ]);
+
+          requestCostUsageCacheRefresh();
+
+          await waitFor(async () => {
+            const summary = await loadCostUsageSummaryFromCache({
+              startMs: Date.UTC(2026, 1, 5),
+              endMs: Date.UTC(2026, 1, 5) + 24 * 60 * 60 * 1000 - 1,
+              requestRefresh: false,
+            });
+            return (
+              summary.cacheStatus?.status === "fresh" &&
+              Math.abs(summary.totals.totalCost - 0.002) < 0.00001
+            );
+          }, 10_000);
+        } finally {
+          clearGatewayModelPricingCacheState();
+        }
+      },
+    );
+  });
+
   it("preserves sessions usage range semantics when cached summaries span the range", async () => {
     const root = await makeSessionCostRoot("cost-cache-session-range");
     const sessionsDir = path.join(root, "agents", "main", "sessions");
@@ -1096,6 +1159,54 @@ describe("session cost usage", () => {
       });
       expect(summary.totals.totalTokens).toBe(10);
       expect(summary.cacheStatus?.status).toBe("fresh");
+    });
+  });
+
+  it("can refresh stale usage cache files in bounded batches", async () => {
+    const root = await makeSessionCostRoot("cost-cache-batched-refresh");
+    const sessionsDir = path.join(root, "agents", "main", "sessions");
+    await fs.mkdir(sessionsDir, { recursive: true });
+    const entry = (sessionId: string, totalTokens: number) =>
+      transcriptText(sessionId, {
+        type: "message",
+        timestamp: "2026-02-05T12:00:00.000Z",
+        message: {
+          role: "assistant",
+          usage: {
+            input: totalTokens,
+            output: 0,
+            totalTokens,
+            cost: { total: totalTokens / 1000 },
+          },
+        },
+      });
+
+    await Promise.all([
+      fs.writeFile(path.join(sessionsDir, "sess-batch-a.jsonl"), entry("sess-batch-a", 10)),
+      fs.writeFile(path.join(sessionsDir, "sess-batch-b.jsonl"), entry("sess-batch-b", 20)),
+    ]);
+
+    await withStateDir(root, async () => {
+      const first = await refreshCostUsageCache({ maxFiles: 1 });
+      expect(first).toBe("partial");
+      const partial = await loadCostUsageSummaryFromCache({
+        startMs: Date.UTC(2026, 1, 5),
+        endMs: Date.UTC(2026, 1, 5) + 24 * 60 * 60 * 1000 - 1,
+        requestRefresh: false,
+      });
+      expect(partial.cacheStatus?.status).toBe("partial");
+      expect(partial.cacheStatus?.cachedFiles).toBe(1);
+      expect(partial.cacheStatus?.pendingFiles).toBe(1);
+
+      const second = await refreshCostUsageCache({ maxFiles: 1 });
+      expect(second).toBe("refreshed");
+      const warm = await loadCostUsageSummaryFromCache({
+        startMs: Date.UTC(2026, 1, 5),
+        endMs: Date.UTC(2026, 1, 5) + 24 * 60 * 60 * 1000 - 1,
+        requestRefresh: false,
+      });
+      expect(warm.cacheStatus?.status).toBe("fresh");
+      expect(warm.totals.totalTokens).toBe(30);
     });
   });
 
