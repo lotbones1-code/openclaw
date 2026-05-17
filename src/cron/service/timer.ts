@@ -8,7 +8,9 @@ import {
   createRunningTaskRun,
   failTaskRunByRunId,
 } from "../../tasks/detached-task-runtime.js";
-import { clearCronJobActive, markCronJobActive } from "../active-jobs.js";
+import { findTaskByRunId } from "../../tasks/runtime-internal.js";
+import type { TaskRecord } from "../../tasks/task-registry.types.js";
+import { clearCronJobActive, isCronJobActive, markCronJobActive } from "../active-jobs.js";
 import { resolveCronDeliveryPlan } from "../delivery-plan.js";
 import { createCronExecutionId } from "../run-id.js";
 import { sweepCronRunSessions } from "../session-reaper.js";
@@ -146,6 +148,16 @@ function isTimeoutRunError(error: unknown): boolean {
   return normalizeCronRunErrorText(error) === timeoutErrorMessage();
 }
 
+function isTimeoutLikeCronError(error: unknown): boolean {
+  const normalized = normalizeCronRunErrorText(error).toLowerCase();
+  return (
+    normalized === timeoutErrorMessage() ||
+    /timeout|timed out|interrupted by gateway restart|gateway restart|stale_running_marker|backing session missing|lost/.test(
+      normalized,
+    )
+  );
+}
+
 function shouldQuarantineRecurringTimeoutLoop(
   job: CronJob,
   result: { status: CronRunStatus; error?: string },
@@ -164,7 +176,7 @@ function shouldQuarantineStoredRecurringTimeoutLoop(job: CronJob) {
     job.schedule.kind !== "at" &&
     typeof job.state.runningAtMs !== "number" &&
     (job.state.lastStatus === "error" || job.state.lastRunStatus === "error") &&
-    isTimeoutRunError(job.state.lastError) &&
+    isTimeoutLikeCronError(job.state.lastError) &&
     (job.state.consecutiveErrors ?? 0) >= RECURRING_TIMEOUT_QUARANTINE_AFTER
   );
 }
@@ -223,18 +235,105 @@ function resolveTimeoutExpiredRunningOutcome(
   };
 }
 
-function reconcileTimeoutExpiredRunningJobs(state: CronServiceState, nowMs: number): boolean {
+function reconcileRunningMarkers(state: CronServiceState, nowMs: number): boolean {
   const outcomes = (state.store?.jobs ?? [])
-    .map((job) => resolveTimeoutExpiredRunningOutcome(job, nowMs))
+    .map((job) => resolveRunningMarkerOutcome(state, job, nowMs))
     .filter((outcome): outcome is TimedCronRunOutcome => outcome !== undefined);
   for (const outcome of outcomes) {
     state.deps.log.warn(
       { jobId: outcome.jobId, startedAt: outcome.startedAt, endedAt: outcome.endedAt },
-      "cron: reconciling timeout-expired running marker",
+      "cron: reconciling stale running marker",
     );
     applyOutcomeToStoredJob(state, outcome);
   }
   return outcomes.length > 0;
+}
+
+function isActiveTaskStatus(status: TaskRecord["status"]): boolean {
+  return status === "queued" || status === "running";
+}
+
+function resolveTerminalTaskOutcome(
+  job: CronJob,
+  task: TaskRecord,
+  runningAtMs: number,
+  nowMs: number,
+): TimedCronRunOutcome | undefined {
+  if (isActiveTaskStatus(task.status)) {
+    return undefined;
+  }
+  const startedAt = task.startedAt ?? runningAtMs;
+  const endedAt = task.endedAt ?? task.lastEventAt ?? nowMs;
+  const taskRunId = createCronExecutionId(job.id, runningAtMs);
+  if (task.status === "succeeded") {
+    return {
+      jobId: job.id,
+      taskRunId,
+      status: "ok",
+      summary: task.terminalSummary ?? task.progressSummary,
+      startedAt,
+      endedAt,
+    };
+  }
+  if (task.status === "timed_out") {
+    return {
+      jobId: job.id,
+      taskRunId,
+      status: "error",
+      error: timeoutErrorMessage(),
+      summary: task.terminalSummary ?? task.progressSummary,
+      startedAt,
+      endedAt,
+    };
+  }
+  return {
+    jobId: job.id,
+    taskRunId,
+    status: "error",
+    error:
+      task.error ??
+      (task.status === "cancelled"
+        ? "cron: job cancelled"
+        : `cron: task registry marked run ${task.status}`),
+    summary: task.terminalSummary ?? task.progressSummary,
+    startedAt,
+    endedAt,
+  };
+}
+
+function resolveRunningMarkerOutcome(
+  state: CronServiceState,
+  job: CronJob,
+  nowMs: number,
+): TimedCronRunOutcome | undefined {
+  const runningAtMs = job.state.runningAtMs;
+  if (typeof runningAtMs !== "number" || !Number.isFinite(runningAtMs)) {
+    return undefined;
+  }
+  const runId = createCronExecutionId(job.id, runningAtMs);
+  const task = findTaskByRunId(runId);
+  if (task) {
+    const terminalOutcome = resolveTerminalTaskOutcome(job, task, runningAtMs, nowMs);
+    if (!terminalOutcome) {
+      return undefined;
+    }
+    state.deps.log.warn(
+      { jobId: job.id, runId, taskId: task.taskId, taskStatus: task.status },
+      "cron: reconciling running marker from task registry",
+    );
+    return terminalOutcome;
+  }
+
+  const timeoutOutcome = resolveTimeoutExpiredRunningOutcome(job, nowMs);
+  if (timeoutOutcome) {
+    return timeoutOutcome;
+  }
+
+  state.deps.log.debug(
+    { jobId: job.id, runId, active: isCronJobActive(job.id), runningAtMs },
+    "cron: running marker has no task registry match yet",
+  );
+  return undefined;
 }
 
 function isAbortError(err: unknown): boolean {
@@ -866,10 +965,7 @@ export async function onTimer(state: CronServiceState) {
     const dueJobs = await locked(state, async () => {
       await ensureLoaded(state, { forceReload: true, skipRecompute: true });
       const dueCheckNow = state.deps.nowMs();
-      const reconciledTimeoutExpiredRunning = reconcileTimeoutExpiredRunningJobs(
-        state,
-        dueCheckNow,
-      );
+      const reconciledRunningMarkers = reconcileRunningMarkers(state, dueCheckNow);
       const quarantinedStoredTimeoutLoops = quarantineStoredRecurringTimeoutLoops(state);
       const due = collectRunnableJobs(state, dueCheckNow);
 
@@ -881,7 +977,7 @@ export async function onTimer(state: CronServiceState) {
           recomputeExpired: true,
           nowMs: dueCheckNow,
         });
-        if (reconciledTimeoutExpiredRunning || quarantinedStoredTimeoutLoops || changed) {
+        if (reconciledRunningMarkers || quarantinedStoredTimeoutLoops || changed) {
           await persist(state);
         }
         return [];
@@ -1151,12 +1247,17 @@ async function planStartupCatchup(
     }
 
     const now = state.deps.nowMs();
+    const reconciledRunningMarkers = reconcileRunningMarkers(state, now);
+    const quarantinedStoredTimeoutLoops = quarantineStoredRecurringTimeoutLoops(state);
     const missed = collectRunnableJobs(state, now, {
       skipJobIds: opts?.skipJobIds,
       skipAtIfAlreadyRan: true,
       allowCronMissedRunByLastRun: true,
     });
     if (missed.length === 0) {
+      if (reconciledRunningMarkers || quarantinedStoredTimeoutLoops) {
+        await persist(state);
+      }
       return { candidates: [], deferredJobIds: [] };
     }
     const sorted = missed.toSorted(
@@ -1288,7 +1389,11 @@ export async function runDueJobs(state: CronServiceState) {
     return;
   }
   const now = state.deps.nowMs();
+  const reconciledRunningMarkers = reconcileRunningMarkers(state, now);
   const due = collectRunnableJobs(state, now);
+  if (reconciledRunningMarkers) {
+    await persist(state);
+  }
   for (const job of due) {
     await executeJob(state, job, now, { forced: false });
   }

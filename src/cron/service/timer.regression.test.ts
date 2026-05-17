@@ -1,5 +1,5 @@
 import fs from "node:fs/promises";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   createAbortAwareIsolatedRunner,
   createDefaultIsolatedRunner,
@@ -12,6 +12,13 @@ import {
   writeCronJobs,
 } from "../../../test/helpers/cron/service-regression-fixtures.js";
 import type { HeartbeatRunResult } from "../../infra/heartbeat-wake.js";
+import {
+  completeTaskRunByRunId,
+  createRunningTaskRun,
+  failTaskRunByRunId,
+} from "../../tasks/detached-task-runtime.js";
+import { resetTaskRegistryForTests } from "../../tasks/task-registry.js";
+import { createCronExecutionId } from "../run-id.js";
 import * as schedule from "../schedule.js";
 import type { CronJob } from "../types.js";
 import { computeJobNextRunAtMs } from "./jobs.js";
@@ -29,6 +36,56 @@ const FAST_TIMEOUT_SECONDS = 1;
 const timerRegressionFixtures = setupCronRegressionFixtures({
   prefix: "cron-service-timer-regressions-",
 });
+
+afterEach(() => {
+  resetTaskRegistryForTests({ persist: false });
+});
+
+function createCronTaskLedger(params: {
+  job: CronJob;
+  runningAt: number;
+  status?: "running" | "succeeded" | "failed" | "timed_out";
+  endedAt?: number;
+  error?: string;
+}) {
+  const runId = createCronExecutionId(params.job.id, params.runningAt);
+  createRunningTaskRun({
+    runtime: "cron",
+    sourceId: params.job.id,
+    ownerKey: "",
+    scopeKind: "system",
+    runId,
+    label: params.job.name,
+    task: params.job.name || params.job.id,
+    deliveryStatus: "not_applicable",
+    notifyPolicy: "silent",
+    startedAt: params.runningAt,
+    lastEventAt: params.runningAt,
+  });
+  if (!params.status || params.status === "running") {
+    return runId;
+  }
+  const endedAt = params.endedAt ?? params.runningAt + 1_000;
+  if (params.status === "succeeded") {
+    completeTaskRunByRunId({
+      runId,
+      runtime: "cron",
+      endedAt,
+      lastEventAt: endedAt,
+      terminalSummary: "task completed",
+    });
+    return runId;
+  }
+  failTaskRunByRunId({
+    runId,
+    runtime: "cron",
+    status: params.status,
+    endedAt,
+    lastEventAt: endedAt,
+    error: params.error,
+  });
+  return runId;
+}
 
 describe("cron service timer regressions", () => {
   it("caps timer delay to 60s for far-future schedules", async () => {
@@ -327,6 +384,207 @@ describe("cron service timer regressions", () => {
     expect(updated?.state.consecutiveErrors).toBe(1);
   });
 
+  it("keeps a running marker when the matching task registry run is still active", async () => {
+    const runningAt = Date.parse("2026-02-06T10:00:00.000Z");
+    const now = runningAt + 30_000;
+    const runIsolatedAgentJob = vi.fn(createDefaultIsolatedRunner());
+    const store = timerRegressionFixtures.makeStorePath();
+    const job = createIsolatedRegressionJob({
+      id: "active-registry-running-marker",
+      name: "active registry running marker",
+      scheduledAt: runningAt,
+      schedule: { kind: "every", everyMs: 60_000, anchorMs: runningAt - 60_000 },
+      payload: { kind: "agentTurn", message: "work", timeoutSeconds: 180 },
+      state: {
+        nextRunAtMs: runningAt,
+        runningAtMs: runningAt,
+      },
+    });
+    createCronTaskLedger({ job, runningAt });
+    await writeCronJobs(store.storePath, [job]);
+    const state = createCronServiceState({
+      cronEnabled: true,
+      storePath: store.storePath,
+      log: noopLogger,
+      nowMs: () => now,
+      enqueueSystemEvent: vi.fn(),
+      requestHeartbeatNow: vi.fn(),
+      runIsolatedAgentJob,
+    });
+
+    await onTimer(state);
+
+    const updated = state.store?.jobs[0];
+    expect(runIsolatedAgentJob).not.toHaveBeenCalled();
+    expect(updated?.state.runningAtMs).toBe(runningAt);
+    expect(updated?.state.lastStatus).toBeUndefined();
+  });
+
+  it("clears a running marker when the matching task registry run succeeded", async () => {
+    const runningAt = Date.parse("2026-02-06T10:00:00.000Z");
+    const endedAt = runningAt + 1_000;
+    const now = runningAt + 30_000;
+    const runIsolatedAgentJob = vi.fn(createDefaultIsolatedRunner());
+    const store = timerRegressionFixtures.makeStorePath();
+    const job = createIsolatedRegressionJob({
+      id: "terminal-success-running-marker",
+      name: "terminal success running marker",
+      scheduledAt: runningAt,
+      schedule: { kind: "every", everyMs: 60_000, anchorMs: runningAt - 60_000 },
+      payload: { kind: "agentTurn", message: "work", timeoutSeconds: 180 },
+      state: {
+        nextRunAtMs: runningAt,
+        runningAtMs: runningAt,
+      },
+    });
+    createCronTaskLedger({ job, runningAt, status: "succeeded", endedAt });
+    await writeCronJobs(store.storePath, [job]);
+    const state = createCronServiceState({
+      cronEnabled: true,
+      storePath: store.storePath,
+      log: noopLogger,
+      nowMs: () => now,
+      enqueueSystemEvent: vi.fn(),
+      requestHeartbeatNow: vi.fn(),
+      runIsolatedAgentJob,
+    });
+
+    await onTimer(state);
+
+    const updated = state.store?.jobs[0];
+    expect(runIsolatedAgentJob).not.toHaveBeenCalled();
+    expect(updated?.state.runningAtMs).toBeUndefined();
+    expect(updated?.state.lastStatus).toBe("ok");
+    expect(updated?.state.lastRunAtMs).toBe(runningAt);
+    expect(updated?.state.lastDurationMs).toBe(endedAt - runningAt);
+    expect(updated?.state.consecutiveErrors).toBe(0);
+  });
+
+  it("clears a running marker when the matching task registry run failed", async () => {
+    const runningAt = Date.parse("2026-02-06T10:00:00.000Z");
+    const now = runningAt + 30_000;
+    const runIsolatedAgentJob = vi.fn(createDefaultIsolatedRunner());
+    const store = timerRegressionFixtures.makeStorePath();
+    const job = createIsolatedRegressionJob({
+      id: "terminal-failed-running-marker",
+      name: "terminal failed running marker",
+      scheduledAt: runningAt,
+      schedule: { kind: "every", everyMs: 60_000, anchorMs: runningAt - 60_000 },
+      payload: { kind: "agentTurn", message: "work", timeoutSeconds: 180 },
+      state: {
+        nextRunAtMs: runningAt,
+        runningAtMs: runningAt,
+      },
+    });
+    createCronTaskLedger({
+      job,
+      runningAt,
+      status: "failed",
+      endedAt: runningAt + 1_500,
+      error: "synthetic failure",
+    });
+    await writeCronJobs(store.storePath, [job]);
+    const state = createCronServiceState({
+      cronEnabled: true,
+      storePath: store.storePath,
+      log: noopLogger,
+      nowMs: () => now,
+      enqueueSystemEvent: vi.fn(),
+      requestHeartbeatNow: vi.fn(),
+      runIsolatedAgentJob,
+    });
+
+    await onTimer(state);
+
+    const updated = state.store?.jobs[0];
+    expect(runIsolatedAgentJob).not.toHaveBeenCalled();
+    expect(updated?.state.runningAtMs).toBeUndefined();
+    expect(updated?.state.lastStatus).toBe("error");
+    expect(updated?.state.lastError).toBe("synthetic failure");
+    expect(updated?.state.consecutiveErrors).toBe(1);
+  });
+
+  it("clears and quarantines a running marker when the matching task registry run timed out at threshold", async () => {
+    const runningAt = Date.parse("2026-02-06T10:00:00.000Z");
+    const now = runningAt + 30_000;
+    const runIsolatedAgentJob = vi.fn(createDefaultIsolatedRunner());
+    const store = timerRegressionFixtures.makeStorePath();
+    const job = createIsolatedRegressionJob({
+      id: "terminal-timeout-running-marker",
+      name: "terminal timeout running marker",
+      scheduledAt: runningAt,
+      schedule: { kind: "every", everyMs: 60_000, anchorMs: runningAt - 60_000 },
+      payload: { kind: "agentTurn", message: "work", timeoutSeconds: 180 },
+      state: {
+        nextRunAtMs: runningAt,
+        runningAtMs: runningAt,
+        consecutiveErrors: 2,
+      },
+    });
+    createCronTaskLedger({
+      job,
+      runningAt,
+      status: "timed_out",
+      endedAt: runningAt + 1_500,
+      error: "cron: job execution timed out",
+    });
+    await writeCronJobs(store.storePath, [job]);
+    const state = createCronServiceState({
+      cronEnabled: true,
+      storePath: store.storePath,
+      log: noopLogger,
+      nowMs: () => now,
+      enqueueSystemEvent: vi.fn(),
+      requestHeartbeatNow: vi.fn(),
+      runIsolatedAgentJob,
+    });
+
+    await onTimer(state);
+
+    const updated = state.store?.jobs[0];
+    expect(runIsolatedAgentJob).not.toHaveBeenCalled();
+    expect(updated?.enabled).toBe(false);
+    expect(updated?.state.runningAtMs).toBeUndefined();
+    expect(updated?.state.nextRunAtMs).toBeUndefined();
+    expect(updated?.state.consecutiveErrors).toBe(3);
+    expect(updated?.state.lastError).toContain("auto-quarantined after 3 consecutive timeouts");
+  });
+
+  it("does not duplicate a running marker with no task registry match before timeout expiry", async () => {
+    const runningAt = Date.parse("2026-02-06T10:00:00.000Z");
+    const now = runningAt + 30_000;
+    const runIsolatedAgentJob = vi.fn(createDefaultIsolatedRunner());
+    const store = timerRegressionFixtures.makeStorePath();
+    const job = createIsolatedRegressionJob({
+      id: "missing-registry-running-marker",
+      name: "missing registry running marker",
+      scheduledAt: runningAt,
+      schedule: { kind: "every", everyMs: 60_000, anchorMs: runningAt - 60_000 },
+      payload: { kind: "agentTurn", message: "work", timeoutSeconds: 180 },
+      state: {
+        nextRunAtMs: runningAt,
+        runningAtMs: runningAt,
+      },
+    });
+    await writeCronJobs(store.storePath, [job]);
+    const state = createCronServiceState({
+      cronEnabled: true,
+      storePath: store.storePath,
+      log: noopLogger,
+      nowMs: () => now,
+      enqueueSystemEvent: vi.fn(),
+      requestHeartbeatNow: vi.fn(),
+      runIsolatedAgentJob,
+    });
+
+    await onTimer(state);
+
+    const updated = state.store?.jobs[0];
+    expect(runIsolatedAgentJob).not.toHaveBeenCalled();
+    expect(updated?.state.runningAtMs).toBe(runningAt);
+    expect(updated?.state.lastStatus).toBeUndefined();
+  });
+
   it("auto-quarantines timeout-expired running markers that hit the timeout loop threshold", async () => {
     const runningAt = Date.parse("2026-02-06T10:00:00.000Z");
     const now = runningAt + 182_500;
@@ -361,6 +619,46 @@ describe("cron service timer regressions", () => {
     expect(updated?.state.runningAtMs).toBeUndefined();
     expect(updated?.state.nextRunAtMs).toBeUndefined();
     expect(updated?.state.consecutiveErrors).toBe(3);
+    expect(updated?.state.lastError).toContain("auto-quarantined after 3 consecutive timeouts");
+  });
+
+  it("auto-quarantines stored recurring jobs with restart-interrupted timeout-like history", async () => {
+    const runningAt = Date.parse("2026-02-06T10:00:00.000Z");
+    const now = runningAt + 300_000;
+    const runIsolatedAgentJob = vi.fn(createDefaultIsolatedRunner());
+    const store = timerRegressionFixtures.makeStorePath();
+    const job = createIsolatedRegressionJob({
+      id: "restart-interrupted-timeout-loop",
+      name: "restart interrupted timeout loop",
+      scheduledAt: runningAt,
+      schedule: { kind: "every", everyMs: 60_000, anchorMs: runningAt - 60_000 },
+      payload: { kind: "agentTurn", message: "work", timeoutSeconds: 180 },
+      state: {
+        nextRunAtMs: runningAt,
+        lastRunAtMs: runningAt - 60_000,
+        lastStatus: "error",
+        lastRunStatus: "error",
+        lastError: "cron: job interrupted by gateway restart",
+        consecutiveErrors: 3,
+      },
+    });
+    await writeCronJobs(store.storePath, [job]);
+    const state = createCronServiceState({
+      cronEnabled: true,
+      storePath: store.storePath,
+      log: noopLogger,
+      nowMs: () => now,
+      enqueueSystemEvent: vi.fn(),
+      requestHeartbeatNow: vi.fn(),
+      runIsolatedAgentJob,
+    });
+
+    await onTimer(state);
+
+    const updated = state.store?.jobs[0];
+    expect(runIsolatedAgentJob).not.toHaveBeenCalled();
+    expect(updated?.enabled).toBe(false);
+    expect(updated?.state.nextRunAtMs).toBeUndefined();
     expect(updated?.state.lastError).toContain("auto-quarantined after 3 consecutive timeouts");
   });
 
