@@ -172,6 +172,70 @@ describe("before_tool_call loop detection behavior", () => {
     });
   });
 
+  it("allows ordinary free SaaS account creation in an OpenClaw-owned browser profile", async () => {
+    const result = await runBeforeToolCallHook({
+      toolName: "browser.click",
+      params: {
+        browserProfile: "openclaw-signups",
+        cdpTargetId: "target-1",
+        ownerTaskId: "task-1",
+        url: "https://runwayml.com/signup",
+        action: "create free account with generated password",
+      },
+      ctx: {
+        agentId: "main",
+        sessionKey: "agent:main:subagent:video-model-bakeoff",
+      },
+    });
+
+    expect(result).toMatchObject({
+      blocked: false,
+    });
+  });
+
+  it("allows non-security SaaS account settings during owned onboarding", async () => {
+    const result = await runBeforeToolCallHook({
+      toolName: "browser.navigate",
+      params: {
+        browserProfile: "openclaw-signups",
+        cdpTargetId: "target-1",
+        ownerTaskId: "task-1",
+        url: "https://app.example.com/account/settings",
+        action: "complete brand workspace account settings",
+      },
+      ctx: {
+        agentId: "main",
+        sessionKey: "agent:main:subagent:video-model-bakeoff",
+      },
+    });
+
+    expect(result).toMatchObject({
+      blocked: false,
+    });
+  });
+
+  it("still blocks account security settings without exact scoped approval", async () => {
+    const result = await runBeforeToolCallHook({
+      toolName: "browser.navigate",
+      params: {
+        browserProfile: "openclaw-signups",
+        cdpTargetId: "target-1",
+        ownerTaskId: "task-1",
+        url: "https://app.example.com/account/security",
+        action: "change password and two-factor settings",
+      },
+      ctx: {
+        agentId: "main",
+        sessionKey: "agent:main:subagent:video-model-bakeoff",
+      },
+    });
+
+    expect(result).toMatchObject({
+      blocked: true,
+      reason: expect.stringContaining("SENSITIVE_ACCOUNT_SURFACE_GATE"),
+    });
+  });
+
   it("does not treat local file paths with Users as human browser surfaces", async () => {
     const result = await runBeforeToolCallHook({
       toolName: "write",

@@ -36,7 +36,18 @@ const SENSITIVE_SURFACE_PATTERNS = [
   "subscription",
   "billing",
   "account/recovery",
-  "account settings",
+  "account/security",
+  "security settings",
+  "security center",
+  "password reset",
+  "reset password",
+  "password change",
+  "change password",
+  "two-factor",
+  "two factor",
+  "2fa",
+  "mfa",
+  "passkey",
 ] as const;
 
 const APPROVAL_KEYS = [
@@ -172,7 +183,7 @@ export function evaluateBrowserSurfaceGuard(params: {
       blocked: true,
       code: "SENSITIVE_ACCOUNT_SURFACE_GATE",
       reason:
-        "SENSITIVE_ACCOUNT_SURFACE_GATE: account/order/refund/checkout/history surface requires exact scoped approval before browser action.",
+        "SENSITIVE_ACCOUNT_SURFACE_GATE: order/refund/checkout/payment/account-security surface requires exact scoped approval before browser action.",
     };
   }
 

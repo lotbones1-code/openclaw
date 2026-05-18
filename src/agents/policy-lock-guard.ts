@@ -70,7 +70,7 @@ const PUBLIC_SOCIAL_MUTATION_PATTERNS = [
   "upload",
 ] as const;
 
-const PAYMENT_ADMIN_PATTERNS = [
+const MONEY_ADMIN_PATTERNS = [
   "refund",
   "payment",
   "checkout",
@@ -80,10 +80,25 @@ const PAYMENT_ADMIN_PATTERNS = [
   "dkim",
   "dmarc",
   "mailbox",
+] as const;
+
+const ACCOUNT_SECURITY_ADMIN_PATTERNS = [
+  "account recovery",
   "account security",
-  "password",
+  "security settings",
+  "security center",
+  "password reset",
+  "reset password",
+  "password change",
+  "change password",
+  "two-factor",
+  "two factor",
+  "2fa",
+  "mfa",
+  "passkey",
   "api key",
-  "credential",
+  "credential rotation",
+  "credential deletion",
 ] as const;
 
 function includesAny(value: string, patterns: readonly string[]): boolean {
@@ -241,7 +256,8 @@ function inferSensitiveAction(params: {
 
   if (
     (isShellActionTool(toolName) || isBrowserActionTool(toolName)) &&
-    includesAny(joinedStrings, PAYMENT_ADMIN_PATTERNS) &&
+    (includesAny(joinedStrings, MONEY_ADMIN_PATTERNS) ||
+      includesAny(joinedStrings, ACCOUNT_SECURITY_ADMIN_PATTERNS)) &&
     includesAny(joinedStrings, [
       "post ",
       "submit",
@@ -263,7 +279,7 @@ function inferSensitiveAction(params: {
       action: "sensitive_mutation",
       code: "SENSITIVE_ACCOUNT_SURFACE_GATE",
       reason:
-        "SENSITIVE_ACCOUNT_SURFACE_GATE: payment/order/checkout/DNS/mailbox/account mutation requires exact scoped approval.",
+        "SENSITIVE_ACCOUNT_SURFACE_GATE: payment/order/checkout/DNS/mailbox/account-security mutation requires exact scoped approval.",
     };
   }
 
