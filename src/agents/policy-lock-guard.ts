@@ -101,6 +101,19 @@ const ACCOUNT_SECURITY_ADMIN_PATTERNS = [
   "credential deletion",
 ] as const;
 
+const BROAD_OWNER_APPROVAL_PATTERNS = [
+  "unlock everything",
+  "unblock everything",
+  "unblock all",
+  "unlock all",
+  "do anything",
+  "do everything",
+  "whatever",
+  "forever",
+  "always allow",
+  "all sensitive",
+] as const;
+
 function includesAny(value: string, patterns: readonly string[]): boolean {
   const lower = value.toLowerCase();
   return patterns.some((pattern) => lower.includes(pattern.toLowerCase()));
@@ -179,6 +192,56 @@ function hasTruthyExactUnlock(value: unknown): boolean {
       typeof value.policyUnlockId === "string" ? value.policyUnlockId : undefined,
     ),
   );
+}
+
+function getStringField(value: unknown, key: string): string | undefined {
+  if (!isPlainObject(value)) {
+    return undefined;
+  }
+  return normalizeOptionalString(typeof value[key] === "string" ? value[key] : undefined);
+}
+
+function hasExactOwnerDirectApproval(value: unknown): boolean {
+  if (!isPlainObject(value)) {
+    return false;
+  }
+  if (value.ownerDirectApproval !== true && value.shamilDirectApproval !== true) {
+    return false;
+  }
+  const approvalText =
+    getStringField(value, "approvalText") ?? getStringField(value, "ownerApprovalText");
+  if (!approvalText || includesAny(approvalText, BROAD_OWNER_APPROVAL_PATTERNS)) {
+    return false;
+  }
+  return Boolean(
+    getStringField(value, "taskId") &&
+    getStringField(value, "lane") &&
+    getStringField(value, "account") &&
+    getStringField(value, "targetClass") &&
+    getStringField(value, "action") &&
+    getStringField(value, "proofPath") &&
+    getStringField(value, "stopInstruction") &&
+    getStringField(value, "rollbackInstruction"),
+  );
+}
+
+function sensitiveMutationLockId(joinedStrings: string): string {
+  if (includesAny(joinedStrings, ["mailbox"])) {
+    return "mailbox:admin";
+  }
+  if (includesAny(joinedStrings, ["dns", "dkim", "dmarc"])) {
+    return "dns:mutation";
+  }
+  if (includesAny(joinedStrings, ["refund"])) {
+    return "payment:refund";
+  }
+  if (includesAny(joinedStrings, ["checkout"])) {
+    return "checkout:mutation";
+  }
+  if (includesAny(joinedStrings, ACCOUNT_SECURITY_ADMIN_PATTERNS)) {
+    return "account:security";
+  }
+  return "payment:order";
 }
 
 function inferSensitiveAction(params: {
@@ -269,13 +332,7 @@ function inferSensitiveAction(params: {
     ])
   ) {
     return {
-      lockId: includesAny(joinedStrings, ["dns", "dkim", "dmarc", "mailbox"])
-        ? "dns:mutation"
-        : includesAny(joinedStrings, ["refund"])
-          ? "payment:refund"
-          : includesAny(joinedStrings, ["checkout"])
-            ? "checkout:mutation"
-            : "payment:order",
+      lockId: sensitiveMutationLockId(joinedStrings),
       action: "sensitive_mutation",
       code: "SENSITIVE_ACCOUNT_SURFACE_GATE",
       reason:
@@ -326,6 +383,24 @@ export function evaluatePolicyLockGuard(params: {
 
   const lock = getPolicyLock(sensitive.lockId);
   if (lock?.state !== "LOCKED") {
+    return { blocked: false };
+  }
+
+  if (hasExactOwnerDirectApproval(params.toolParams)) {
+    appendPolicyLockAudit({
+      lockId: sensitive.lockId,
+      sessionKey: params.sessionKey,
+      runId: params.runId,
+      action: sensitive.action,
+      source: "before-tool-policy-guard",
+      channel: params.toolName,
+      decision: "USED",
+      reasonCode: "OWNER_DIRECT_APPROVAL_USED",
+      proofPath: getStringField(params.toolParams, "proofPath"),
+      detail:
+        getStringField(params.toolParams, "approvalText") ??
+        getStringField(params.toolParams, "ownerApprovalText"),
+    });
     return { blocked: false };
   }
 

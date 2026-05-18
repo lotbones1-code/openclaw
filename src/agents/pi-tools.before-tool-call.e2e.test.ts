@@ -236,6 +236,191 @@ describe("before_tool_call loop detection behavior", () => {
     });
   });
 
+  it("allows exact Shamil-approved payment checkout actions", async () => {
+    await withOpenClawTestState(
+      {
+        label: "before-tool-owner-direct-payment-approval",
+        applyEnv: true,
+      },
+      async () => {
+        setPolicyLock({
+          lockId: "checkout:mutation",
+          state: "LOCKED",
+          source: "test",
+          now: 100,
+        });
+
+        const result = await runBeforeToolCallHook({
+          toolName: "browser.click",
+          params: {
+            browserProfile: "openclaw-personal",
+            cdpTargetId: "target-1",
+            ownerTaskId: "task-1",
+            taskId: "task-1",
+            lane: "personal_purchase",
+            account: "personal-shopping",
+            targetClass: "approved_purchase_checkout",
+            url: "https://merchant.example/checkout",
+            action: "submit checkout for explicitly approved item",
+            ownerDirectApproval: true,
+            approvalText: "Shamil explicitly approved buying this exact item up to $50 now.",
+            proofPath: "/tmp/openclaw-approved-purchase.md",
+            stopInstruction: "Stop if price, item, merchant, or payment method differs.",
+            rollbackInstruction:
+              "Cancel before submit if details differ; record receipt after submit.",
+          },
+          ctx: {
+            agentId: "main",
+            sessionKey: "agent:main:telegram:personal",
+            runId: "run-purchase",
+          },
+        });
+
+        expect(result).toMatchObject({ blocked: false });
+      },
+    );
+  });
+
+  it("keeps broad unlock text from approving sensitive actions", async () => {
+    await withOpenClawTestState(
+      {
+        label: "before-tool-owner-direct-broad-unlock-denied",
+        applyEnv: true,
+      },
+      async () => {
+        setPolicyLock({
+          lockId: "payment:order",
+          state: "LOCKED",
+          source: "test",
+          now: 100,
+        });
+
+        const result = await runBeforeToolCallHook({
+          toolName: "browser.click",
+          params: {
+            browserProfile: "openclaw-personal",
+            cdpTargetId: "target-1",
+            ownerTaskId: "task-1",
+            taskId: "task-1",
+            lane: "personal_purchase",
+            account: "personal-shopping",
+            targetClass: "approved_purchase_checkout",
+            url: "https://merchant.example/payment",
+            action: "submit payment",
+            ownerDirectApproval: true,
+            approvalText: "unlock everything and do anything",
+            proofPath: "/tmp/openclaw-approved-purchase.md",
+            stopInstruction: "stop",
+            rollbackInstruction: "rollback",
+          },
+          ctx: {
+            agentId: "main",
+            sessionKey: "agent:main:telegram:personal",
+            runId: "run-purchase",
+          },
+        });
+
+        expect(result).toMatchObject({
+          blocked: true,
+          reason: expect.stringContaining("SENSITIVE_ACCOUNT_SURFACE_GATE"),
+        });
+      },
+    );
+  });
+
+  it("allows exact Shamil-approved account security changes", async () => {
+    await withOpenClawTestState(
+      {
+        label: "before-tool-owner-direct-account-security-approval",
+        applyEnv: true,
+      },
+      async () => {
+        setPolicyLock({
+          lockId: "account:security",
+          state: "LOCKED",
+          source: "test",
+          now: 100,
+        });
+
+        const result = await runBeforeToolCallHook({
+          toolName: "browser.click",
+          params: {
+            browserProfile: "openclaw-personal",
+            cdpTargetId: "target-1",
+            ownerTaskId: "task-1",
+            taskId: "task-1",
+            lane: "account_admin",
+            account: "example-saas",
+            targetClass: "approved_account_security_change",
+            url: "https://app.example.com/account/security",
+            action: "change password for explicitly approved account",
+            ownerDirectApproval: true,
+            approvalText: "Shamil explicitly approved changing this exact account password now.",
+            proofPath: "/tmp/openclaw-approved-account-security.md",
+            stopInstruction: "Stop if the account or security action differs.",
+            rollbackInstruction: "Save recovery proof and record completion state.",
+          },
+          ctx: {
+            agentId: "main",
+            sessionKey: "agent:main:telegram:personal",
+            runId: "run-account-admin",
+          },
+        });
+
+        expect(result).toMatchObject({ blocked: false });
+      },
+    );
+  });
+
+  it("routes mailbox admin and account security gates to their own lock ids", async () => {
+    await withOpenClawTestState(
+      {
+        label: "before-tool-sensitive-lock-routing",
+        applyEnv: true,
+      },
+      async () => {
+        setPolicyLock({
+          lockId: "mailbox:admin",
+          state: "LOCKED",
+          source: "test",
+          now: 100,
+        });
+        setPolicyLock({
+          lockId: "account:security",
+          state: "UNLOCKED",
+          source: "test",
+          now: 100,
+        });
+        setPolicyLock({
+          lockId: "payment:order",
+          state: "UNLOCKED",
+          source: "test",
+          now: 100,
+        });
+
+        const mailbox = await runBeforeToolCallHook({
+          toolName: "browser.click",
+          params: {
+            browserProfile: "openclaw-admin",
+            cdpTargetId: "target-1",
+            ownerTaskId: "task-1",
+            url: "https://mail.example/admin/mailbox",
+            action: "update mailbox admin setting",
+          },
+          ctx: {
+            agentId: "main",
+            sessionKey: "agent:main:telegram:personal",
+          },
+        });
+
+        expect(mailbox).toMatchObject({
+          blocked: true,
+          reason: expect.stringContaining("SENSITIVE_ACCOUNT_SURFACE_GATE"),
+        });
+      },
+    );
+  });
+
   it("does not treat local file paths with Users as human browser surfaces", async () => {
     const result = await runBeforeToolCallHook({
       toolName: "write",

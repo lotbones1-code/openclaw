@@ -57,6 +57,19 @@ const APPROVAL_KEYS = [
   "exactScopedApproval",
 ] as const;
 
+const BROAD_OWNER_APPROVAL_PATTERNS = [
+  "unlock everything",
+  "unblock everything",
+  "unblock all",
+  "unlock all",
+  "do anything",
+  "do everything",
+  "whatever",
+  "forever",
+  "always allow",
+  "all sensitive",
+] as const;
+
 function includesPattern(value: string, patterns: readonly string[]): boolean {
   const lower = value.toLowerCase();
   return patterns.some((pattern) => lower.includes(pattern));
@@ -101,6 +114,9 @@ function hasTruthyApproval(value: unknown): boolean {
   if (!isPlainObject(value)) {
     return false;
   }
+  if (hasExactOwnerDirectApproval(value)) {
+    return true;
+  }
   for (const key of APPROVAL_KEYS) {
     if (value[key] === true) {
       return true;
@@ -115,6 +131,37 @@ function hasTruthyApproval(value: unknown): boolean {
     );
   }
   return false;
+}
+
+function getStringField(value: unknown, key: string): string | undefined {
+  if (!isPlainObject(value)) {
+    return undefined;
+  }
+  return normalizeOptionalString(typeof value[key] === "string" ? value[key] : undefined);
+}
+
+function hasExactOwnerDirectApproval(value: unknown): boolean {
+  if (!isPlainObject(value)) {
+    return false;
+  }
+  if (value.ownerDirectApproval !== true && value.shamilDirectApproval !== true) {
+    return false;
+  }
+  const approvalText =
+    getStringField(value, "approvalText") ?? getStringField(value, "ownerApprovalText");
+  if (!approvalText || includesPattern(approvalText, BROAD_OWNER_APPROVAL_PATTERNS)) {
+    return false;
+  }
+  return Boolean(
+    getStringField(value, "taskId") &&
+    getStringField(value, "lane") &&
+    getStringField(value, "account") &&
+    getStringField(value, "targetClass") &&
+    getStringField(value, "action") &&
+    getStringField(value, "proofPath") &&
+    getStringField(value, "stopInstruction") &&
+    getStringField(value, "rollbackInstruction"),
+  );
 }
 
 function isBrowserOrAccountTool(toolName: string, strings: string[]): boolean {
