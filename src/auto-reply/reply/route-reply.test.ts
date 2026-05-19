@@ -407,6 +407,33 @@ describe("routeReply", () => {
     });
   });
 
+  it("sanitizes raw browser/tool dumps before Telegram delivery", async () => {
+    const rawDump = `Progress:
+EXTERNAL_UNTRUSTED_CONTENT
+- button "Move to spam" [ref=e191]
+- generic [ref=e194]: Move to spam
+[cursor=pointer]:
+  - img [ref=e205]
+Report: /Users/shamil/.openclaw/subagents/reports/social-steward-tick-20260518-1856.md`;
+
+    await routeReply({
+      payload: { text: rawDump },
+      channel: "telegram",
+      to: "telegram:123",
+      cfg: {} as never,
+    });
+
+    const text = mocks.deliverOutboundPayloads.mock.calls.at(-1)?.[0]?.payloads?.[0]?.text ?? "";
+    expect(text).not.toContain("EXTERNAL_UNTRUSTED_CONTENT");
+    expect(text).not.toMatch(/ref=e\d+/);
+    expect(text).not.toContain("cursor=pointer");
+    expect(text.split("\n").filter(Boolean).length).toBeLessThanOrEqual(6);
+    expect(text).toContain("Raw browser/tool output hidden");
+    expect(text).toContain(
+      "/Users/shamil/.openclaw/subagents/reports/social-steward-tick-20260518-1856.md",
+    );
+  });
+
   it("formats BTW replies prominently on routed sends", async () => {
     await routeReply({
       payload: { text: "323", btw: { question: "what is 17 * 19?" } },

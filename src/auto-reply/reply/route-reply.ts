@@ -38,6 +38,47 @@ function loadDeliverRuntime() {
   return deliverRuntimePromise;
 }
 
+const RAW_TOOL_OUTPUT_PATTERNS = [
+  /EXTERNAL_UNTRUSTED_CONTENT/i,
+  /\[ref=e\d+\]/i,
+  /\bcursor=pointer\b/i,
+  /^\s*-\s+(button|generic|img|list|listitem)\b.+\[[^\]]*ref=e\d+/im,
+  /\b(button|generic|img)\s+"[^"]+"\s+\[ref=e\d+\]/i,
+];
+
+function looksLikeRawToolOutput(text: string): boolean {
+  if (!text.trim()) return false;
+  if (RAW_TOOL_OUTPUT_PATTERNS.some((pattern) => pattern.test(text))) return true;
+
+  const lines = text.split(/\r?\n/);
+  const rawishLines = lines.filter(
+    (line) =>
+      /^\s*-\s+(button|generic|img|list|listitem|textbox)\b/i.test(line) ||
+      /\[[^\]]*ref=e\d+/i.test(line),
+  );
+  return rawishLines.length >= 4;
+}
+
+function extractProofPaths(text: string): string[] {
+  const matches = text.match(/\/Users\/shamil\/[^\s`"'<>)]*/g) ?? [];
+  return Array.from(new Set(matches.map((path) => path.replace(/[.,;:]+$/, "")))).slice(0, 2);
+}
+
+function sanitizeTelegramVisibleText(text: string): string {
+  if (!looksLikeRawToolOutput(text)) return text;
+
+  const proofPaths = extractProofPaths(text);
+  const lines = [
+    "Raw browser/tool output hidden from Telegram.",
+    "Reason: it contained internal selector/accessibility details, not a readable status.",
+    "Result: see the report/proof path instead of the raw dump.",
+    ...(proofPaths.length
+      ? proofPaths.map((path) => `Report: ${path}`)
+      : ["Report: not found in message"]),
+  ];
+  return lines.slice(0, 6).join("\n");
+}
+
 export type RouteReplyParams = {
   /** The reply payload to send. */
   payload: ReplyPayload;
@@ -149,9 +190,14 @@ export async function routeReply(params: RouteReplyParams): Promise<RouteReplyRe
   if (!normalized) {
     return { ok: true };
   }
+  const formattedExternalText = formatBtwTextForExternalDelivery(normalized);
+  const textForDelivery =
+    formattedExternalText && channelId === "telegram"
+      ? sanitizeTelegramVisibleText(formattedExternalText)
+      : formattedExternalText;
   const externalPayload: ReplyPayload = {
     ...normalized,
-    text: formatBtwTextForExternalDelivery(normalized),
+    text: textForDelivery,
   };
 
   let text = externalPayload.text ?? "";
