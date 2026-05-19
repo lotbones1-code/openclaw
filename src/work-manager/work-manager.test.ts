@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import type { CronJob } from "../cron/types.js";
 import type { ReliabilityHealthSnapshot } from "../reliability/supervisor.types.js";
 import type { TaskFlowRecord } from "../tasks/task-flow-registry.types.js";
 import type { TaskRecord } from "../tasks/task-registry.types.js";
@@ -123,6 +124,44 @@ describe("work manager", () => {
       reason: "resource_locked",
       resource: "browser_profile:titan-ig",
     });
+  });
+
+  it("does not double-count a running cron row when task registry has the same run id", () => {
+    const walletRunId = `cron:wallet:${now}`;
+    const walletTask = task({
+      taskId: "wallet-task",
+      sourceId: "wallet",
+      runId: walletRunId,
+      label: "Titan Wallet Watcher — every 2m",
+      task: "Poll payment wallet",
+      status: "running",
+      createdAt: now,
+      startedAt: now,
+    });
+    const walletCron = {
+      id: "wallet",
+      name: "Titan Wallet Watcher — every 2m",
+      enabled: true,
+      createdAtMs: now,
+      updatedAtMs: now,
+      schedule: { kind: "every", everyMs: 120_000 },
+      sessionTarget: "isolated",
+      wakeMode: "now",
+      payload: { kind: "agentTurn", message: "Poll payment wallet" },
+      delivery: { mode: "none" },
+      state: { runningAtMs: now },
+    } as CronJob;
+
+    const snapshot = buildWorkManagerSnapshot({
+      nowMs: now,
+      tasks: [walletTask],
+      cronJobs: [walletCron],
+      reliability: reliability("green"),
+      mode: "admission",
+    });
+
+    expect(snapshot.runningByPool.revenue).toBe(1);
+    expect(snapshot.locks.filter((lock) => lock.resource === "payment/wallet")).toHaveLength(1);
   });
 
   it("prioritizes revenue work over cleanup work", () => {

@@ -40,10 +40,15 @@ export function buildWorkManagerSnapshot(
 ): WorkManagerSnapshot {
   const nowMs = input.nowMs ?? Date.now();
   const mode = input.mode ?? "shadow";
+  const taskRunIds = new Set(
+    (input.tasks ?? [])
+      .map((task) => task.runId)
+      .filter((runId): runId is string => typeof runId === "string" && runId.length > 0),
+  );
   const candidates = [
     ...(input.tasks ?? []).map((task) => candidateFromTask(task)),
     ...(input.taskFlows ?? []).map((flow) => candidateFromTaskFlow(flow)),
-    ...(input.cronJobs ?? []).flatMap((job) => candidateFromCronJob(job)),
+    ...(input.cronJobs ?? []).flatMap((job) => candidateFromCronJob(job, taskRunIds)),
   ].filter((candidate): candidate is WorkManagerCandidate => Boolean(candidate));
 
   const runningByPool = emptyPoolCounts();
@@ -170,6 +175,30 @@ export function rankWorkCandidates(candidates: WorkManagerCandidate[]): WorkMana
   });
 }
 
+export function createCronWorkCandidate(params: {
+  job: CronJob;
+  nowMs: number;
+  status?: ManagedWorkStatus;
+}): WorkManagerCandidate {
+  const payloadText =
+    params.job.payload.kind === "agentTurn" ? params.job.payload.message : params.job.payload.text;
+  const inferred = inferWork(params.job.name, payloadText, params.job.id);
+  return {
+    workId: `cron:${params.job.id}:${params.nowMs}`,
+    lane: params.job.name,
+    pool: inferred.pool,
+    priority: inferred.priority,
+    requestedResources: inferred.resources,
+    expectedOutput: payloadText,
+    proofPath: params.job.id,
+    timeoutMs: 30 * 60_000,
+    owner: "cron",
+    status: params.status ?? "queued",
+    createdAt: params.nowMs,
+    leaseUntil: params.nowMs + 30 * 60_000,
+  };
+}
+
 export function summarizeWorkManagerStatus(
   snapshot: WorkManagerSnapshot,
 ): WorkManagerStatusSummary {
@@ -283,27 +312,22 @@ function candidateFromTaskFlow(flow: TaskFlowRecord): WorkManagerCandidate {
   };
 }
 
-function candidateFromCronJob(job: CronJob): WorkManagerCandidate[] {
+function candidateFromCronJob(
+  job: CronJob,
+  taskRunIds: ReadonlySet<string>,
+): WorkManagerCandidate[] {
   if (typeof job.state.runningAtMs !== "number") {
     return [];
   }
-  const payloadText = job.payload.kind === "agentTurn" ? job.payload.message : job.payload.text;
-  const inferred = inferWork(job.name, payloadText, job.id);
+  if (taskRunIds.has(`cron:${job.id}:${job.state.runningAtMs}`)) {
+    return [];
+  }
   return [
-    {
-      workId: `cron:${job.id}:${job.state.runningAtMs}`,
-      lane: job.name,
-      pool: inferred.pool,
-      priority: inferred.priority,
-      requestedResources: inferred.resources,
-      expectedOutput: payloadText,
-      proofPath: job.id,
-      timeoutMs: 30 * 60_000,
-      owner: "cron",
+    createCronWorkCandidate({
+      job,
+      nowMs: job.state.runningAtMs,
       status: "running",
-      createdAt: job.state.runningAtMs,
-      leaseUntil: job.state.runningAtMs + 30 * 60_000,
-    },
+    }),
   ];
 }
 

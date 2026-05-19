@@ -1,7 +1,10 @@
 import { resolveFailoverReasonFromError } from "../../agents/failover-error.js";
 import type { CronConfig, CronRetryOn } from "../../config/types.cron.js";
 import type { HeartbeatRunResult } from "../../infra/heartbeat-wake.js";
-import { recordReliabilityEvent } from "../../reliability/supervisor.js";
+import {
+  getLatestReliabilityHealthSnapshot,
+  recordReliabilityEvent,
+} from "../../reliability/supervisor.js";
 import { DEFAULT_AGENT_ID } from "../../routing/session-key.js";
 import { normalizeOptionalLowercaseString } from "../../shared/string-coerce.js";
 import {
@@ -11,6 +14,12 @@ import {
 } from "../../tasks/detached-task-runtime.js";
 import { findTaskByRunId, listTaskRecords } from "../../tasks/runtime-internal.js";
 import type { TaskRecord } from "../../tasks/task-registry.types.js";
+import {
+  buildWorkManagerSnapshot,
+  createCronWorkCandidate,
+  evaluateWorkAdmission,
+  type WorkResourceLock,
+} from "../../work-manager/work-manager.js";
 import { clearCronJobActive, isCronJobActive, markCronJobActive } from "../active-jobs.js";
 import { resolveCronDeliveryPlan } from "../delivery-plan.js";
 import { createCronExecutionId } from "../run-id.js";
@@ -1061,8 +1070,10 @@ export async function onTimer(state: CronServiceState) {
       const reconciledRunningMarkers = reconcileRunningMarkers(state, dueCheckNow);
       const quarantinedStoredTimeoutLoops = quarantineStoredRecurringTimeoutLoops(state);
       const due = collectRunnableJobs(state, dueCheckNow);
+      const admitted = filterRunnableJobsByWorkAdmission(state, due, dueCheckNow);
+      const admissionDeferred = admitted.length !== due.length;
 
-      if (due.length === 0) {
+      if (admitted.length === 0) {
         // Use maintenance-only recompute to avoid advancing past-due nextRunAtMs
         // values without execution. This prevents jobs from being silently skipped
         // when the timer wakes up but findDueJobs returns empty (see #13992).
@@ -1070,20 +1081,25 @@ export async function onTimer(state: CronServiceState) {
           recomputeExpired: true,
           nowMs: dueCheckNow,
         });
-        if (reconciledRunningMarkers || quarantinedStoredTimeoutLoops || changed) {
+        if (
+          reconciledRunningMarkers ||
+          quarantinedStoredTimeoutLoops ||
+          changed ||
+          admissionDeferred
+        ) {
           await persist(state);
         }
         return [];
       }
 
       const now = state.deps.nowMs();
-      for (const job of due) {
+      for (const job of admitted) {
         job.state.runningAtMs = now;
         job.state.lastError = undefined;
       }
       await persist(state);
 
-      return due.map((j) => ({
+      return admitted.map((j) => ({
         id: j.id,
         job: j,
       }));
@@ -1310,6 +1326,81 @@ function collectRunnableJobs(
       allowCronMissedRunByLastRun: opts?.allowCronMissedRunByLastRun,
     }),
   );
+}
+
+function filterRunnableJobsByWorkAdmission(
+  state: CronServiceState,
+  due: CronJob[],
+  nowMs: number,
+): CronJob[] {
+  if (!state.store || due.length === 0) {
+    return due;
+  }
+
+  const snapshot = buildWorkManagerSnapshot({
+    nowMs,
+    mode: "admission",
+    tasks: listTaskRecords(),
+    cronJobs: state.store.jobs,
+    reliability: getLatestReliabilityHealthSnapshot(),
+  });
+  const admitted: CronJob[] = [];
+  const reservedLocks: WorkResourceLock[] = [];
+
+  for (const job of due) {
+    const candidate = createCronWorkCandidate({ job, nowMs, status: "queued" });
+    const decision = evaluateWorkAdmission(
+      {
+        ...snapshot,
+        locks: [...snapshot.locks, ...reservedLocks],
+      },
+      candidate,
+    );
+
+    if (decision.decision === "allow") {
+      admitted.push(job);
+      for (const resource of candidate.requestedResources) {
+        reservedLocks.push({
+          lockId: `${resource}:${candidate.workId}`,
+          ownerWorkId: candidate.workId,
+          resource,
+          pool: candidate.pool,
+          priority: candidate.priority,
+          acquiredAt: nowMs,
+          leaseUntil: nowMs + 30 * 60_000,
+          enforced: true,
+        });
+      }
+      continue;
+    }
+
+    job.state.nextRunAtMs = nowMs + 60_000;
+    state.deps.log.info(
+      {
+        jobId: job.id,
+        reason: decision.reason,
+        blockedResources: decision.blockedResources,
+        deferredUntilMs: job.state.nextRunAtMs,
+      },
+      "cron: work manager admission deferred job",
+    );
+    recordReliabilityEvent({
+      subsystem: "cron",
+      code: "work_admission_deferred",
+      severity: "info",
+      subject: job.id,
+      message: `cron: work manager deferred ${job.name} (${decision.reason})`,
+      recoverable: false,
+      quiet: true,
+      createdAt: nowMs,
+      metadata: {
+        reason: decision.reason,
+        blockedResources: decision.blockedResources,
+      },
+    });
+  }
+
+  return admitted;
 }
 
 export async function runMissedJobs(
