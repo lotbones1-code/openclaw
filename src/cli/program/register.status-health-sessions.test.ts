@@ -5,6 +5,7 @@ import { registerStatusHealthSessionsCommands } from "./register.status-health-s
 const mocks = vi.hoisted(() => ({
   statusCommand: vi.fn(),
   healthCommand: vi.fn(),
+  reliabilityStatusCommand: vi.fn(),
   sessionsCommand: vi.fn(),
   sessionsCleanupCommand: vi.fn(),
   tasksListCommand: vi.fn(),
@@ -26,6 +27,7 @@ const mocks = vi.hoisted(() => ({
 
 const statusCommand = mocks.statusCommand;
 const healthCommand = mocks.healthCommand;
+const reliabilityStatusCommand = mocks.reliabilityStatusCommand;
 const sessionsCommand = mocks.sessionsCommand;
 const sessionsCleanupCommand = mocks.sessionsCleanupCommand;
 const tasksListCommand = mocks.tasksListCommand;
@@ -46,6 +48,10 @@ vi.mock("../../commands/status.js", () => ({
 
 vi.mock("../../commands/health.js", () => ({
   healthCommand: mocks.healthCommand,
+}));
+
+vi.mock("../../commands/reliability.js", () => ({
+  reliabilityStatusCommand: mocks.reliabilityStatusCommand,
 }));
 
 vi.mock("../../commands/sessions.js", () => ({
@@ -91,6 +97,7 @@ describe("registerStatusHealthSessionsCommands", () => {
     runtime.exit.mockImplementation(() => {});
     statusCommand.mockResolvedValue(undefined);
     healthCommand.mockResolvedValue(undefined);
+    reliabilityStatusCommand.mockResolvedValue(undefined);
     sessionsCommand.mockResolvedValue(undefined);
     sessionsCleanupCommand.mockResolvedValue(undefined);
     tasksListCommand.mockResolvedValue(undefined);
@@ -149,6 +156,17 @@ describe("registerStatusHealthSessionsCommands", () => {
         json: true,
         timeoutMs: 2500,
         verbose: true,
+      }),
+      runtime,
+    );
+  });
+
+  it("runs reliability status command with json forwarding", async () => {
+    await runCli(["reliability", "status", "--json"]);
+
+    expect(reliabilityStatusCommand).toHaveBeenCalledWith(
+      expect.objectContaining({
+        json: true,
       }),
       runtime,
     );

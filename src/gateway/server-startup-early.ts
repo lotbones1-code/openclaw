@@ -9,6 +9,7 @@ import {
   setSkillsRemoteRegistry,
 } from "../infra/skills-remote.js";
 import type { PluginRegistry } from "../plugins/registry-types.js";
+import { startAutonomicReliabilitySupervisor } from "../reliability/supervisor.js";
 import {
   configureTaskRegistryMaintenance,
   startTaskRegistryMaintenance,
@@ -86,6 +87,7 @@ export async function startGatewayEarlyRuntime(params: {
       cronRuntimeAuthoritative: true,
     });
     startTaskRegistryMaintenance();
+    startAutonomicReliabilitySupervisor();
   }
 
   const skillsChangeUnsub = params.minimalTestGateway

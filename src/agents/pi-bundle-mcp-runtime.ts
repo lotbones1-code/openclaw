@@ -13,6 +13,7 @@ import type {
 import type { ErrorObject, ValidateFunction } from "ajv";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { logWarn } from "../logger.js";
+import { recordMcpStartupFailure } from "../reliability/supervisor.js";
 import { resolveGlobalSingleton } from "../shared/global-singleton.js";
 import { redactSensitiveUrlLikeString } from "../shared/net/redact-sensitive-url.js";
 import { normalizeOptionalString } from "../shared/string-coerce.js";
@@ -284,9 +285,12 @@ export function createSessionMcpRuntime(params: {
             }
           } catch (error) {
             if (!disposed) {
-              logWarn(
-                `bundle-mcp: failed to start server "${serverName}" (${resolved.description}): ${redactErrorUrls(error)}`,
-              );
+              const message = `bundle-mcp: failed to start server "${serverName}" (${resolved.description}): ${redactErrorUrls(error)}`;
+              logWarn(message);
+              recordMcpStartupFailure({
+                serverName,
+                message,
+              });
             }
             await disposeSession(session);
             sessions.delete(serverName);

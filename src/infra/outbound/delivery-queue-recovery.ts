@@ -1,4 +1,5 @@
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
+import { recordReliabilityEvent } from "../../reliability/supervisor.js";
 import { formatErrorMessage } from "../errors.js";
 import {
   ackDelivery,
@@ -66,6 +67,23 @@ const PERMANENT_ERROR_PATTERNS: readonly RegExp[] = [
 
 const drainInProgress = new Map<string, boolean>();
 const entriesInProgress = new Set<string>();
+
+function recordDeliveryRecoverySummary(summary: RecoverySummary): void {
+  const hasIssue = summary.failed > 0 || summary.skippedMaxRetries > 0;
+  const hasRecovery = summary.recovered > 0;
+  if (!hasIssue && !hasRecovery) {
+    return;
+  }
+  recordReliabilityEvent({
+    subsystem: "delivery",
+    code: hasIssue ? "delivery_recovery_issue" : "delivery_recovery_drained",
+    severity: hasIssue ? "warn" : "info",
+    message: `delivery recovery recovered=${summary.recovered} failed=${summary.failed} skippedMaxRetries=${summary.skippedMaxRetries} deferredBackoff=${summary.deferredBackoff}`,
+    recoverable: hasIssue,
+    createdAt: Date.now(),
+    metadata: summary as unknown as Record<string, unknown>,
+  });
+}
 
 function getErrnoCode(err: unknown): string | null {
   return err && typeof err === "object" && "code" in err
@@ -432,6 +450,7 @@ export async function recoverPendingDeliveries(opts: {
   opts.log.info(
     `Delivery recovery complete: ${summary.recovered} recovered, ${summary.failed} failed, ${summary.skippedMaxRetries} skipped (max retries), ${summary.deferredBackoff} deferred (backoff)`,
   );
+  recordDeliveryRecoverySummary(summary);
   return summary;
 }
 

@@ -5,6 +5,7 @@ import {
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { formatErrorMessage } from "../infra/errors.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
+import { recordModelFallbackReliabilityDecision } from "../reliability/supervisor.js";
 import { normalizeOptionalString } from "../shared/string-coerce.js";
 import { sanitizeForLog } from "../terminal/ansi.js";
 import { hasAnyAuthProfileStoreSource } from "./auth-profiles/source-check.js";
@@ -313,7 +314,7 @@ function recordFailedCandidateAttempt(params: {
     status: described.status,
     code: described.code,
   });
-  return logModelFallbackDecision({
+  const decision: ModelFallbackDecisionParams = {
     decision: "candidate_failed",
     runId: params.runId,
     requestedProvider: params.requestedProvider ?? params.candidate.provider,
@@ -329,7 +330,18 @@ function recordFailedCandidateAttempt(params: {
     isPrimary: params.isPrimary,
     requestedModelMatched: params.requestedModelMatched,
     fallbackConfigured: params.fallbackConfigured,
+  };
+  recordModelFallbackReliabilityDecision({
+    decision: decision.decision,
+    requestedProvider: decision.requestedProvider,
+    requestedModel: decision.requestedModel,
+    candidateProvider: decision.candidate.provider,
+    candidateModel: decision.candidate.model,
+    reason: decision.reason,
+    nextCandidateProvider: decision.nextCandidate?.provider,
+    nextCandidateModel: decision.nextCandidate?.model,
   });
+  return logModelFallbackDecision(decision);
 }
 
 function findLiveSessionModelSwitchRedirectIndex(params: {
@@ -763,6 +775,16 @@ export async function runWithModelFallback<T>(params: {
   let lastError: unknown;
   const cooldownProbeUsedProviders = new Set<string>();
   const observeDecision = async (decision: ModelFallbackDecisionParams) => {
+    recordModelFallbackReliabilityDecision({
+      decision: decision.decision,
+      requestedProvider: decision.requestedProvider,
+      requestedModel: decision.requestedModel,
+      candidateProvider: decision.candidate.provider,
+      candidateModel: decision.candidate.model,
+      reason: decision.reason,
+      nextCandidateProvider: decision.nextCandidate?.provider,
+      nextCandidateModel: decision.nextCandidate?.model,
+    });
     const fallbackStep = logModelFallbackDecision(decision);
     if (fallbackStep) {
       await params.onFallbackStep?.(fallbackStep);

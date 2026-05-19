@@ -1,6 +1,7 @@
 import type { Command } from "commander";
 import { flowsCancelCommand, flowsListCommand, flowsShowCommand } from "../../commands/flows.js";
 import { healthCommand } from "../../commands/health.js";
+import { reliabilityStatusCommand } from "../../commands/reliability.js";
 import { sessionsCleanupCommand } from "../../commands/sessions-cleanup.js";
 import { sessionsCommand } from "../../commands/sessions.js";
 import { statusCommand } from "../../commands/status.js";
@@ -125,6 +126,20 @@ export function registerStatusHealthSessionsCommands(program: Command) {
           },
           defaultRuntime,
         );
+      });
+    });
+
+  const reliabilityCmd = program
+    .command("reliability")
+    .description("Inspect native reliability supervisor health");
+
+  reliabilityCmd
+    .command("status")
+    .description("Show latest reliability supervisor snapshot")
+    .option("--json", "Output JSON instead of text", false)
+    .action(async (opts) => {
+      await runCommandWithRuntime(defaultRuntime, async () => {
+        await reliabilityStatusCommand({ json: Boolean(opts.json) }, defaultRuntime);
       });
     });
 

@@ -2,6 +2,7 @@ import type { SessionMaintenanceWarning } from "../config/sessions/store-mainten
 import type { SessionEntry } from "../config/sessions/types.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
+import { recordReliabilityEvent } from "../reliability/supervisor.js";
 import { deliveryContextFromSession } from "../utils/delivery-context.shared.js";
 import { isDeliverableMessageChannel, normalizeMessageChannel } from "../utils/message-channel.js";
 import { buildOutboundSessionContext } from "./outbound/session-context.js";
@@ -112,6 +113,22 @@ export async function deliverSessionMaintenanceWarning(params: WarningParams): P
   warnedContexts.set(params.sessionKey, contextKey);
 
   const text = buildWarningText(params.warning);
+  recordReliabilityEvent({
+    subsystem: "sessions",
+    code: "context_pressure",
+    severity: "warn",
+    subject: params.sessionKey,
+    message: text,
+    recoverable: true,
+    createdAt: Date.now(),
+    metadata: {
+      activeSessionKey: params.warning.activeSessionKey,
+      wouldPrune: params.warning.wouldPrune,
+      wouldCap: params.warning.wouldCap,
+      pruneAfterMs: params.warning.pruneAfterMs,
+      maxEntries: params.warning.maxEntries,
+    },
+  });
   const target = resolveWarningDeliveryTarget(params.entry);
 
   if (!target.channel || !target.to) {

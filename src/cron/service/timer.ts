@@ -1,6 +1,7 @@
 import { resolveFailoverReasonFromError } from "../../agents/failover-error.js";
 import type { CronConfig, CronRetryOn } from "../../config/types.cron.js";
 import type { HeartbeatRunResult } from "../../infra/heartbeat-wake.js";
+import { recordReliabilityEvent } from "../../reliability/supervisor.js";
 import { DEFAULT_AGENT_ID } from "../../routing/session-key.js";
 import { normalizeOptionalLowercaseString } from "../../shared/string-coerce.js";
 import {
@@ -185,6 +186,19 @@ function quarantineRecurringTimeoutLoop(state: CronServiceState, job: CronJob) {
   job.enabled = false;
   job.state.nextRunAtMs = undefined;
   job.state.lastError = `cron: job auto-quarantined after ${job.state.consecutiveErrors ?? RECURRING_TIMEOUT_QUARANTINE_AFTER} consecutive timeouts`;
+  recordReliabilityEvent({
+    subsystem: "cron",
+    code: "cron_timeout_loop_quarantined",
+    severity: "warn",
+    subject: job.id,
+    message: job.state.lastError,
+    recoverable: false,
+    createdAt: Date.now(),
+    metadata: {
+      jobName: job.name,
+      consecutiveErrors: job.state.consecutiveErrors,
+    },
+  });
   state.deps.log.warn(
     {
       jobId: job.id,
@@ -244,6 +258,21 @@ function reconcileRunningMarkers(state: CronServiceState, nowMs: number): boolea
       { jobId: outcome.jobId, startedAt: outcome.startedAt, endedAt: outcome.endedAt },
       "cron: reconciling stale running marker",
     );
+    recordReliabilityEvent({
+      subsystem: "cron",
+      code: "cron_running_marker_reconciled",
+      severity: outcome.status === "ok" ? "info" : "warn",
+      subject: outcome.jobId,
+      message:
+        outcome.error ?? `cron: reconciled running marker with terminal outcome ${outcome.status}`,
+      recoverable: false,
+      createdAt: outcome.endedAt,
+      metadata: {
+        taskRunId: outcome.taskRunId,
+        startedAt: outcome.startedAt,
+        status: outcome.status,
+      },
+    });
     applyOutcomeToStoredJob(state, outcome);
   }
   return outcomes.length > 0;
