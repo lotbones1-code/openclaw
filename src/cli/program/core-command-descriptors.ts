@@ -105,6 +105,11 @@ const coreCliCommandCatalog = defineCommandDescriptorCatalog([
     description: "Inspect native reliability supervisor health",
     hasSubcommands: true,
   },
+  {
+    name: "work",
+    description: "Inspect native work manager queue, locks, and priority state",
+    hasSubcommands: true,
+  },
 ] as const satisfies ReadonlyArray<CoreCliCommandDescriptor>);
 
 export const CORE_CLI_COMMAND_DESCRIPTORS = coreCliCommandCatalog.descriptors;

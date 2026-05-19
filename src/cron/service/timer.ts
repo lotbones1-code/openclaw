@@ -9,7 +9,7 @@ import {
   createRunningTaskRun,
   failTaskRunByRunId,
 } from "../../tasks/detached-task-runtime.js";
-import { findTaskByRunId } from "../../tasks/runtime-internal.js";
+import { findTaskByRunId, listTaskRecords } from "../../tasks/runtime-internal.js";
 import type { TaskRecord } from "../../tasks/task-registry.types.js";
 import { clearCronJobActive, isCronJobActive, markCronJobActive } from "../active-jobs.js";
 import { resolveCronDeliveryPlan } from "../delivery-plan.js";
@@ -60,6 +60,7 @@ const DEFAULT_FAILURE_ALERT_AFTER = 2;
 const DEFAULT_FAILURE_ALERT_COOLDOWN_MS = 60 * 60_000; // 1 hour
 const RECURRING_TIMEOUT_QUARANTINE_AFTER = 3;
 const RUNNING_MARKER_TIMEOUT_RECONCILE_GRACE_MS = 2_000;
+const RUNNING_MARKER_RUN_ID_DRIFT_MS = 5_000;
 
 type ResolvedFailureAlert = {
   after: number;
@@ -287,13 +288,13 @@ function resolveTerminalTaskOutcome(
   task: TaskRecord,
   runningAtMs: number,
   nowMs: number,
+  taskRunId = createCronExecutionId(job.id, runningAtMs),
 ): TimedCronRunOutcome | undefined {
   if (isActiveTaskStatus(task.status)) {
     return undefined;
   }
   const startedAt = task.startedAt ?? runningAtMs;
   const endedAt = task.endedAt ?? task.lastEventAt ?? nowMs;
-  const taskRunId = createCronExecutionId(job.id, runningAtMs);
   if (task.status === "succeeded") {
     return {
       jobId: job.id,
@@ -330,6 +331,56 @@ function resolveTerminalTaskOutcome(
   };
 }
 
+function findCronTaskForRunningMarker(
+  job: CronJob,
+  runningAtMs: number,
+):
+  | {
+      task: TaskRecord;
+      taskRunId: string;
+      driftMs: number;
+    }
+  | undefined {
+  const exactRunId = createCronExecutionId(job.id, runningAtMs);
+  const exactTask = findTaskByRunId(exactRunId);
+  if (exactTask) {
+    return { task: exactTask, taskRunId: exactRunId, driftMs: 0 };
+  }
+
+  const prefix = `cron:${job.id}:`;
+  let best:
+    | {
+        task: TaskRecord;
+        taskRunId: string;
+        driftMs: number;
+      }
+    | undefined;
+
+  for (const task of listTaskRecords()) {
+    if (
+      !task.runId ||
+      task.runtime !== "cron" ||
+      task.sourceId !== job.id ||
+      !task.runId.startsWith(prefix)
+    ) {
+      continue;
+    }
+    const startedAtFromRunId = Number(task.runId.slice(prefix.length));
+    if (!Number.isFinite(startedAtFromRunId)) {
+      continue;
+    }
+    const driftMs = Math.abs(startedAtFromRunId - runningAtMs);
+    if (driftMs > RUNNING_MARKER_RUN_ID_DRIFT_MS) {
+      continue;
+    }
+    if (!best || driftMs < best.driftMs) {
+      best = { task, taskRunId: task.runId, driftMs };
+    }
+  }
+
+  return best;
+}
+
 function resolveRunningMarkerOutcome(
   state: CronServiceState,
   job: CronJob,
@@ -340,14 +391,27 @@ function resolveRunningMarkerOutcome(
     return undefined;
   }
   const runId = createCronExecutionId(job.id, runningAtMs);
-  const task = findTaskByRunId(runId);
-  if (task) {
-    const terminalOutcome = resolveTerminalTaskOutcome(job, task, runningAtMs, nowMs);
+  const matchedRun = findCronTaskForRunningMarker(job, runningAtMs);
+  if (matchedRun) {
+    const terminalOutcome = resolveTerminalTaskOutcome(
+      job,
+      matchedRun.task,
+      runningAtMs,
+      nowMs,
+      matchedRun.taskRunId,
+    );
     if (!terminalOutcome) {
       return undefined;
     }
     state.deps.log.warn(
-      { jobId: job.id, runId, taskId: task.taskId, taskStatus: task.status },
+      {
+        jobId: job.id,
+        runId: matchedRun.taskRunId,
+        expectedRunId: runId,
+        runIdDriftMs: matchedRun.driftMs,
+        taskId: matchedRun.task.taskId,
+        taskStatus: matchedRun.task.status,
+      },
       "cron: reconciling running marker from task registry",
     );
     return terminalOutcome;

@@ -20,6 +20,7 @@ import {
   tasksNotifyCommand,
   tasksShowCommand,
 } from "../../commands/tasks.js";
+import { workShadowCommand, workStatusCommand } from "../../commands/work.js";
 import { setVerbose } from "../../globals.js";
 import { defaultRuntime } from "../../runtime.js";
 import { formatDocsLink } from "../../terminal/links.js";
@@ -140,6 +141,28 @@ export function registerStatusHealthSessionsCommands(program: Command) {
     .action(async (opts) => {
       await runCommandWithRuntime(defaultRuntime, async () => {
         await reliabilityStatusCommand({ json: Boolean(opts.json) }, defaultRuntime);
+      });
+    });
+
+  const workCmd = program.command("work").description("Inspect native work manager state");
+
+  workCmd
+    .command("status")
+    .description("Show work manager admission/status snapshot")
+    .option("--json", "Output JSON instead of text", false)
+    .action(async (opts) => {
+      await runCommandWithRuntime(defaultRuntime, async () => {
+        await workStatusCommand({ json: Boolean(opts.json) }, defaultRuntime);
+      });
+    });
+
+  workCmd
+    .command("shadow")
+    .description("Show work manager shadow classification without enforcing admission")
+    .option("--json", "Output JSON instead of text", false)
+    .action(async (opts) => {
+      await runCommandWithRuntime(defaultRuntime, async () => {
+        await workShadowCommand({ json: Boolean(opts.json) }, defaultRuntime);
       });
     });
 

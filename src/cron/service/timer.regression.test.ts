@@ -44,11 +44,12 @@ afterEach(() => {
 function createCronTaskLedger(params: {
   job: CronJob;
   runningAt: number;
+  runIdRunningAt?: number;
   status?: "running" | "succeeded" | "failed" | "timed_out";
   endedAt?: number;
   error?: string;
 }) {
-  const runId = createCronExecutionId(params.job.id, params.runningAt);
+  const runId = createCronExecutionId(params.job.id, params.runIdRunningAt ?? params.runningAt);
   createRunningTaskRun({
     runtime: "cron",
     sourceId: params.job.id,
@@ -382,6 +383,56 @@ describe("cron service timer regressions", () => {
     expect(updated?.state.lastError).toBe("cron: job execution timed out");
     expect(updated?.state.lastRunAtMs).toBe(runningAt);
     expect(updated?.state.consecutiveErrors).toBe(1);
+  });
+
+  it("reconciles a running marker when the matching cron task run id has minor timestamp drift", async () => {
+    const store = timerRegressionFixtures.makeStorePath();
+    const runningAt = Date.parse("2026-05-19T06:00:00.000Z");
+    const now = runningAt + 95_000;
+    const job = createIsolatedRegressionJob({
+      id: "wallet-watcher",
+      name: "Titan Wallet Watcher — every 2m",
+      scheduledAt: runningAt,
+      schedule: { kind: "every", everyMs: 120_000, anchorMs: runningAt - 120_000 },
+      payload: {
+        kind: "agentTurn",
+        message: "Run exactly one lightweight wallet watcher tick.",
+        timeoutSeconds: FAST_TIMEOUT_SECONDS,
+      },
+      state: {
+        runningAtMs: runningAt,
+        lastRunAtMs: runningAt - 120_000,
+        lastRunStatus: "ok",
+        lastStatus: "ok",
+        nextRunAtMs: runningAt + 120_000,
+        consecutiveErrors: 0,
+      },
+    });
+    await writeCronJobs(store.storePath, [job]);
+    createCronTaskLedger({
+      job,
+      runningAt,
+      runIdRunningAt: runningAt + 2,
+      status: "succeeded",
+      endedAt: runningAt + 20_000,
+    });
+    const state = createCronServiceState({
+      cronEnabled: true,
+      storePath: store.storePath,
+      log: noopLogger,
+      nowMs: () => now,
+      enqueueSystemEvent: vi.fn(),
+      requestHeartbeatNow: vi.fn(),
+      runIsolatedAgentJob: vi.fn().mockResolvedValue({ status: "ok", summary: "should not run" }),
+    });
+
+    await onTimer(state);
+
+    const reconciled = state.store?.jobs.find((entry) => entry.id === "wallet-watcher");
+    expect(reconciled?.state.runningAtMs).toBeUndefined();
+    expect(reconciled?.state.lastStatus).toBe("ok");
+    expect(reconciled?.state.consecutiveErrors).toBe(0);
+    expect(state.deps.runIsolatedAgentJob).not.toHaveBeenCalled();
   });
 
   it("keeps a running marker when the matching task registry run is still active", async () => {
