@@ -16,6 +16,7 @@ import type { AuthProfileCredential } from "../../agents/auth-profiles/types.js"
 import { resolveProfileUnusableUntilForDisplay } from "../../agents/auth-profiles/usage.js";
 import { resolveProviderEnvApiKeyCandidates } from "../../agents/model-auth-env-vars.js";
 import { resolveEnvApiKey } from "../../agents/model-auth.js";
+import { validateClaudeCliPrimaryRoute } from "../../agents/model-route-canonicalization.js";
 import {
   buildModelAliasIndex,
   isCliProvider,
@@ -307,6 +308,17 @@ export async function modelsStatusCommand(
       return hasAny;
     });
   const providerAuthMap = new Map(providerAuth.map((entry) => [entry.provider, entry]));
+  const primaryAuthProof = resolvePrimaryAuthProof({
+    provider: resolved.provider,
+    providerAuth: providerAuthMap.get(normalizeProviderId(resolved.provider)),
+  });
+  const primaryClaudeRoute = validateClaudeCliPrimaryRoute({
+    strictCliOnly: cfg.executionKernel?.enabled === true,
+    primaryModelRef: resolvedLabel,
+    actualBackend: resolved.provider,
+    authProfileProvider: primaryAuthProof.authProfileProvider,
+    authProfileMode: primaryAuthProof.authProfileMode,
+  });
   const missingProvidersInUse = Array.from(providersInUse)
     .filter((provider) => !providerAuthMap.has(provider))
     .filter((provider) => !syntheticAuthByProvider.has(provider))
@@ -462,6 +474,17 @@ export async function modelsStatusCommand(
       defaultModel: defaultLabel,
       resolvedDefault: resolvedLabel,
       fallbacks,
+      executionKernel: {
+        enabled: cfg.executionKernel?.enabled === true,
+        primaryClaudeRoute: {
+          ...primaryClaudeRoute,
+          defaultModel: defaultLabel,
+          resolvedDefault: resolvedLabel,
+          actualBackend: resolved.provider,
+          authProfileProvider: primaryAuthProof.authProfileProvider,
+          authProfileMode: primaryAuthProof.authProfileMode,
+        },
+      },
       imageModel: imageModel || null,
       imageFallbacks,
       ...(agentId
@@ -825,4 +848,30 @@ export async function modelsStatusCommand(
   if (opts.check) {
     runtime.exit(checkStatus);
   }
+}
+
+function resolvePrimaryAuthProof(params: {
+  provider: string;
+  providerAuth:
+    | {
+        provider: string;
+        profiles: {
+          labels: string[];
+        };
+      }
+    | undefined;
+}): { authProfileProvider?: string; authProfileMode?: string } {
+  const labels = params.providerAuth?.profiles.labels ?? [];
+  const claudeCliOauth = labels.find((label) => /:claude-cli=oauth/i.test(label));
+  if (claudeCliOauth) {
+    return { authProfileProvider: "claude-cli", authProfileMode: "oauth" };
+  }
+  const oauth = labels.find((label) => /=oauth/i.test(label));
+  if (oauth) {
+    return {
+      authProfileProvider: params.providerAuth?.provider ?? params.provider,
+      authProfileMode: "oauth",
+    };
+  }
+  return { authProfileProvider: params.providerAuth?.provider ?? params.provider };
 }

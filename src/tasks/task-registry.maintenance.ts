@@ -407,24 +407,25 @@ function containedStopControlForTask(task: TaskRecord): TaskControlRecord | unde
   if (!isActiveTask(task)) {
     return undefined;
   }
-  return taskRegistryMaintenanceRuntime
-    .listTaskControlRecords({ state: "contained" })
-    .find((record) => {
-      if (!commandIsStopLike(record.command)) {
-        return false;
-      }
-      if (record.scope === "global" || record.command === "red_stop_all") {
-        return true;
-      }
-      return Boolean(
-        (record.taskId && record.taskId === task.taskId) ||
-        (record.runId && record.runId === task.runId) ||
-        (record.sessionKey &&
-          (record.sessionKey === task.childSessionKey ||
-            record.sessionKey === task.requesterSessionKey ||
-            record.sessionKey === task.ownerKey)),
-      );
-    });
+  return taskRegistryMaintenanceRuntime.listTaskControlRecords().find((record) => {
+    if (record.state !== "requested" && record.state !== "contained") {
+      return false;
+    }
+    if (!commandIsStopLike(record.command)) {
+      return false;
+    }
+    if (record.scope === "global" || record.command === "red_stop_all") {
+      return true;
+    }
+    return Boolean(
+      (record.taskId && record.taskId === task.taskId) ||
+      (record.runId && record.runId === task.runId) ||
+      (record.sessionKey &&
+        (record.sessionKey === task.childSessionKey ||
+          record.sessionKey === task.requesterSessionKey ||
+          record.sessionKey === task.ownerKey)),
+    );
+  });
 }
 
 function shouldMarkLost(task: TaskRecord, now: number): boolean {
@@ -442,7 +443,7 @@ function markTaskStoppedByContainedControl(
   control: TaskControlRecord,
   now: number,
 ): TaskRecord {
-  const endedAt = task.endedAt ?? control.containedAt ?? now;
+  const endedAt = task.endedAt ?? control.containedAt ?? control.requestedAt ?? now;
   const updated = taskRegistryMaintenanceRuntime.markTaskTerminalById({
     taskId: task.taskId,
     status: "cancelled",

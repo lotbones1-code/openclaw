@@ -1,4 +1,5 @@
 import type { CronJob } from "../cron/types.js";
+import type { OpenClawDirectiveContract } from "../execution-kernel/execution-kernel.js";
 import type {
   ReliabilityHealthSnapshot,
   ReliabilityStatus,
@@ -151,6 +152,7 @@ export type WorkManagerSnapshot = {
   mode: WorkManagerMode;
   status: ReliabilityStatus;
   activeMission?: OpenClawMissionContract;
+  activeDirective?: OpenClawDirectiveContract;
   runningByPool: Record<WorkPool, number>;
   queuedByPool: Record<WorkPool, number>;
   blockedByPool: Record<WorkPool, number>;
@@ -190,6 +192,7 @@ export type WorkManagerStatusSummary = {
   mode: WorkManagerMode;
   status: ReliabilityStatus;
   activeMission?: OpenClawMissionContract;
+  activeDirective?: OpenClawDirectiveContract;
   runningByPool: Record<WorkPool, number>;
   queuedByPool: Record<WorkPool, number>;
   blockedLocks: WorkResourceLock[];

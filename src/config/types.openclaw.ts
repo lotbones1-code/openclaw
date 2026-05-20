@@ -136,6 +136,10 @@ export type OpenClawConfig = {
   gateway?: GatewayConfig;
   memory?: MemoryConfig;
   mcp?: McpConfig;
+  executionKernel?: {
+    /** Native V1 directive/typed-gate/stop/proof enforcement switch. */
+    enabled?: boolean;
+  };
   /** Network-level SSRF protection via an operator-managed forward proxy. */
   proxy?: ProxyConfig;
 };

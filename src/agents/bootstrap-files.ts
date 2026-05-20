@@ -226,6 +226,34 @@ function filterHeartbeatBootstrapFile(
   return files.filter((file) => file.name !== DEFAULT_HEARTBEAT_FILENAME);
 }
 
+function isExecutionKernelEnabled(config?: OpenClawConfig): boolean {
+  const candidate = config as
+    | (OpenClawConfig & { executionKernel?: { enabled?: boolean } })
+    | undefined;
+  return candidate?.executionKernel?.enabled === true;
+}
+
+function assertCriticalBootstrapAuthorityFits(params: {
+  files: WorkspaceBootstrapFile[];
+  config?: OpenClawConfig;
+}): void {
+  if (!isExecutionKernelEnabled(params.config)) {
+    return;
+  }
+  const maxChars = resolveBootstrapMaxChars(params.config);
+  const criticalNames = new Set(["AGENTS.md", "IDENTITY.md"]);
+  const offenders = params.files
+    .filter((file) => criticalNames.has(file.name) && !file.missing)
+    .filter((file) => (file.content ?? "").length > maxChars)
+    .map((file) => `${file.name}:${(file.content ?? "").length}/${maxChars}`);
+  if (offenders.length === 0) {
+    return;
+  }
+  throw new Error(
+    `BOOTSTRAP_CRITICAL_TRUNCATED: critical bootstrap authority exceeds bootstrapMaxChars (${offenders.join(", ")}). Compact or split authority before injection.`,
+  );
+}
+
 export async function resolveBootstrapFilesForRun(params: {
   workspaceDir: string;
   config?: OpenClawConfig;
@@ -279,6 +307,7 @@ export async function resolveBootstrapContextForRun(params: {
   contextFiles: EmbeddedContextFile[];
 }> {
   const bootstrapFiles = await resolveBootstrapFilesForRun(params);
+  assertCriticalBootstrapAuthorityFits({ files: bootstrapFiles, config: params.config });
   const contextFiles = buildBootstrapContextFiles(bootstrapFiles, {
     maxChars: resolveBootstrapMaxChars(params.config),
     totalMaxChars: resolveBootstrapTotalMaxChars(params.config),

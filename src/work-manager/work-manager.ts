@@ -1,4 +1,8 @@
 import type { CronJob } from "../cron/types.js";
+import {
+  validateOpenClawDirectiveContract,
+  type OpenClawDirectiveContract,
+} from "../execution-kernel/execution-kernel.js";
 import type { ReliabilityHealthSnapshot } from "../reliability/supervisor.types.js";
 import type { TaskControlRecord } from "../tasks/task-control-registry.js";
 import type { TaskFlowRecord, JsonValue } from "../tasks/task-flow-registry.types.js";
@@ -118,6 +122,7 @@ export function buildWorkManagerSnapshot(
 
   const pressure = summarizeReliabilityPressure(input.reliability);
   const activeMission = resolveActiveMission(input.taskFlows ?? []);
+  const activeDirective = resolveActiveDirective(input.taskFlows ?? []);
   const queuedP0P1Work = candidates.filter((candidate) => {
     const status = candidate.status ?? "queued";
     return status === "queued" && isP0P1OrDirective(candidate.priority);
@@ -136,6 +141,7 @@ export function buildWorkManagerSnapshot(
     mode,
     status: pressure.reliabilityStatus,
     activeMission,
+    activeDirective,
     runningByPool,
     queuedByPool,
     blockedByPool,
@@ -462,6 +468,7 @@ export function summarizeWorkManagerStatus(
     mode: snapshot.mode,
     status: snapshot.status,
     activeMission: snapshot.activeMission,
+    activeDirective: snapshot.activeDirective,
     runningByPool: snapshot.runningByPool,
     queuedByPool: snapshot.queuedByPool,
     blockedLocks: snapshot.blockedLocks,
@@ -481,6 +488,9 @@ export function toHumanWorkStatusLines(snapshot: WorkManagerSnapshot): string[] 
   const mission = summary.activeMission
     ? `${summary.activeMission.status} ${summary.activeMission.selected_option}`
     : "none";
+  const directive = summary.activeDirective
+    ? `${summary.activeDirective.current_state} ${summary.activeDirective.selected_option}`
+    : "none";
   const running = compactPoolCounts(summary.runningByPool);
   const queued = compactPoolCounts(summary.queuedByPool);
   const p0p1 = summary.p0p1RevenueWork.length;
@@ -490,7 +500,7 @@ export function toHumanWorkStatusLines(snapshot: WorkManagerSnapshot): string[] 
   const blocked = summary.blockedLocks.length;
   const dead = summary.deadLetteredWork.length;
   return [
-    `Work Manager ${summary.mode}: ${summary.status} | mission: ${mission}`,
+    `Work Manager ${summary.mode}: ${summary.status} | mission: ${mission} | directive: ${directive}`,
     `running: ${running || "none"} | queued: ${queued || "none"}`,
     `blocked locks: ${blocked} | dead-lettered: ${dead} | P0/P1 revenue: ${p0p1} | queued P0/P1: ${summary.queuedP0P1Work.length}`,
     `next best safe work: ${next}`,
@@ -801,6 +811,34 @@ function resolveActiveMission(flows: TaskFlowRecord[]): OpenClawMissionContract 
       }
       return b.updatedAt - a.updatedAt;
     })[0]?.mission;
+}
+
+function resolveActiveDirective(flows: TaskFlowRecord[]): OpenClawDirectiveContract | undefined {
+  return flows
+    .map((flow) => ({
+      directive: readDirectiveContract(flow.stateJson),
+      updatedAt: flow.updatedAt,
+    }))
+    .filter((entry): entry is { directive: OpenClawDirectiveContract; updatedAt: number } => {
+      const directive = entry.directive;
+      if (!directive) {
+        return false;
+      }
+      return !["completed", "succeeded", "failed", "cancelled", "stopped"].includes(
+        directive.current_state,
+      );
+    })
+    .sort((a, b) => b.updatedAt - a.updatedAt)[0]?.directive;
+}
+
+function readDirectiveContract(
+  value: JsonValue | undefined,
+): OpenClawDirectiveContract | undefined {
+  const directive = isRecord(value) ? value.openclawDirective : undefined;
+  if (!isRecord(directive) || !validateOpenClawDirectiveContract(directive).valid) {
+    return undefined;
+  }
+  return directive as unknown as OpenClawDirectiveContract;
 }
 
 function readMissionContract(value: JsonValue | undefined): OpenClawMissionContract | undefined {

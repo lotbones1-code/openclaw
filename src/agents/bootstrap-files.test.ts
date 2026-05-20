@@ -171,6 +171,25 @@ describe("resolveBootstrapContextForRun", () => {
     expect(result.contextFiles.some((file) => file.path.endsWith("AGENTS.md"))).toBe(true);
   });
 
+  it("fails instead of silently truncating critical authority when execution kernel is enabled", async () => {
+    const workspaceDir = await makeTempWorkspace("openclaw-bootstrap-critical-");
+    await fs.writeFile(
+      path.join(workspaceDir, "AGENTS.md"),
+      "critical authority\n".repeat(200),
+      "utf8",
+    );
+
+    await expect(
+      resolveBootstrapContextForRun({
+        workspaceDir,
+        config: {
+          executionKernel: { enabled: true },
+          agents: { defaults: { bootstrapMaxChars: 100 } },
+        } as never,
+      }),
+    ).rejects.toThrow(/BOOTSTRAP_CRITICAL_TRUNCATED/);
+  });
+
   it("uses heartbeat-only bootstrap files in lightweight heartbeat mode", async () => {
     const workspaceDir = await makeTempWorkspace("openclaw-bootstrap-");
     await fs.writeFile(path.join(workspaceDir, "HEARTBEAT.md"), "check inbox", "utf8");

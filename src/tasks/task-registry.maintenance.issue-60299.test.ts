@@ -209,6 +209,39 @@ describe("task-registry maintenance issue #60299", () => {
     });
   });
 
+  it("marks stale no-child running records interrupted when RED STOP ALL is requested", async () => {
+    const task = makeStaleTask({
+      runtime: "cron",
+      taskId: "red-stop-no-child",
+      sourceId: "cron-red-stop",
+      childSessionKey: undefined,
+    });
+
+    const { currentTasks } = createTaskRegistryMaintenanceHarness({
+      tasks: [task],
+      activeCronJobIds: ["cron-red-stop"],
+      taskControls: [
+        {
+          controlId: "red-stop-all-1",
+          command: "red_stop_all",
+          scope: "global",
+          source: "test",
+          reason: "Shamil emergency stop",
+          requestedAt: Date.now() - 1000,
+          state: "requested",
+          resumeCondition: "explicit_resume",
+        },
+      ],
+    });
+
+    expect(await runTaskRegistryMaintenance()).toMatchObject({ reconciled: 1 });
+    expect(currentTasks.get(task.taskId)).toMatchObject({
+      status: "cancelled",
+      error: "stopped by native task control",
+      terminalSummary: expect.stringContaining("red_stop_all"),
+    });
+  });
+
   it("marks stale cron tasks lost once the runtime no longer tracks the job as active", async () => {
     const childSessionKey = "agent:main:workspace:channel:test-channel";
     const task = makeStaleTask({

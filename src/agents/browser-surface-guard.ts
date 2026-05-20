@@ -1,3 +1,10 @@
+import {
+  validateOpenClawDirectiveContract,
+  verifyPreAction,
+  type OpenClawDirectiveContract,
+  type PreActionCandidate,
+  type TypedGateCode,
+} from "../execution-kernel/execution-kernel.js";
 import { normalizeOptionalString } from "../shared/string-coerce.js";
 import { getPolicyLock } from "../tasks/policy-lock-registry.js";
 import { isPlainObject } from "../utils.js";
@@ -6,7 +13,7 @@ export type BrowserSurfaceGuardDecision =
   | { blocked: false }
   | {
       blocked: true;
-      code: "WRONG_SURFACE_DETECTED" | "SENSITIVE_ACCOUNT_SURFACE_GATE";
+      code: "WRONG_SURFACE_DETECTED" | "SENSITIVE_ACCOUNT_SURFACE_GATE" | TypedGateCode;
       reason: string;
     };
 
@@ -239,6 +246,33 @@ function hasSensitiveSurface(strings: string[]): boolean {
   return strings.some((entry) => includesPattern(entry, SENSITIVE_SURFACE_PATTERNS));
 }
 
+function evaluateExecutionKernelPreAction(value: unknown): BrowserSurfaceGuardDecision | undefined {
+  if (!isPlainObject(value)) {
+    return undefined;
+  }
+  const directive = value.openclawDirective;
+  const candidateAction = value.candidateAction;
+  if (
+    !validateOpenClawDirectiveContract(directive).valid ||
+    !isPlainObject(candidateAction) ||
+    typeof candidateAction.action !== "string"
+  ) {
+    return undefined;
+  }
+  const decision = verifyPreAction({
+    directive: directive as OpenClawDirectiveContract,
+    candidateAction: candidateAction as unknown as PreActionCandidate,
+  });
+  if (decision.decision === "allow") {
+    return { blocked: false };
+  }
+  return {
+    blocked: true,
+    code: decision.gate,
+    reason: decision.reason,
+  };
+}
+
 function hasExplicitOpenClawOwner(value: unknown): boolean {
   if (!isPlainObject(value)) {
     return false;
@@ -267,6 +301,11 @@ export function evaluateBrowserSurfaceGuard(params: {
   const strings = collectStrings(params.toolParams);
   if (!isBrowserOrAccountTool(params.toolName, strings)) {
     return { blocked: false };
+  }
+
+  const executionKernelDecision = evaluateExecutionKernelPreAction(params.toolParams);
+  if (executionKernelDecision) {
+    return executionKernelDecision;
   }
 
   if (

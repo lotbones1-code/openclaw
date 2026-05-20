@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { CronJob } from "../cron/types.js";
+import { buildOpenClawDirectiveContract } from "../execution-kernel/execution-kernel.js";
 import type { ReliabilityHealthSnapshot } from "../reliability/supervisor.types.js";
 import type { TaskFlowRecord } from "../tasks/task-flow-registry.types.js";
 import type { TaskRecord } from "../tasks/task-registry.types.js";
@@ -347,6 +348,64 @@ describe("work manager", () => {
     expect(validateMissionContract(mission)).toEqual({ valid: true, missing: [] });
     expect(snapshot.activeMission?.mission_id).toBe("mission-1");
     expect(snapshot.queuedP0P1Work.map((candidate) => candidate.workId)).toContain("flow-1");
+  });
+
+  it("surfaces a valid active directive contract from TaskFlow state", () => {
+    const directive = buildOpenClawDirectiveContract({
+      directiveId: "directive-higgsfield-starter",
+      userRequest: "buy and connect Higgsfield Starter monthly",
+      selectedOption: "Starter monthly",
+      goal: "complete Higgsfield Starter setup without selecting Pro or annual",
+      taskClass: "saas_subscription",
+      vendor: "Higgsfield",
+      account: "shamilbones1@gmail.com",
+      workspace: "Shamil Workspace",
+      allowedActions: ["select_plan", "submit_checkout", "connect_cli"],
+      forbiddenActions: ["select_pro", "select_annual", "add_credits"],
+      constraints: ["Starter only", "monthly only"],
+      budgetOrPriceCap: 25,
+      billingPeriod: "monthly",
+      exactPlanName: "Starter",
+      successCriteria: ["Starter workspace verified", "CLI connected"],
+      proofRequired: ["plan proof", "workspace proof"],
+      hardGates: ["MISSING_CVV", "MISSING_2FA", "CAPTCHA_REQUIRED"],
+      fallbackPolicy: "closest safe setup verification",
+      stopInstruction: "stop Higgsfield halts this directive",
+      rollbackInstruction: "do not repeat purchase; verify existing subscription first",
+      proofPath: "/tmp/higgsfield-directive.md",
+      createdFromMessage: "Shamil authorized Starter around $20 monthly",
+      nowIso: new Date(now).toISOString(),
+      ownerDirectApproval: true,
+    });
+
+    const snapshot = buildWorkManagerSnapshot({
+      nowMs: now,
+      tasks: [],
+      taskFlows: [
+        flow({
+          stateJson: {
+            openclawDirective: directive,
+            openclawWorkManager: {
+              version: 1,
+              pool: "personal",
+              priority: "P0_USER_DIRECTIVE",
+              requestedResources: ["subscription:higgsfield"],
+              proofPath: "/tmp/higgsfield-directive.md",
+              timeoutMs: 300_000,
+              workStatus: "queued",
+            },
+          },
+        }),
+      ],
+      reliability: reliability("green"),
+      mode: "admission",
+    });
+
+    expect(snapshot.activeDirective?.directive_id).toBe("directive-higgsfield-starter");
+    expect(snapshot.activeDirective?.selected_option).toBe("Starter monthly");
+    expect(snapshot.queuedP0P1Work.map((candidate) => candidate.priority)).toContain(
+      "P0_USER_DIRECTIVE",
+    );
   });
 
   it("builds a valid revenue mission contract from a selected user objective", () => {

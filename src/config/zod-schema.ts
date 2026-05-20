@@ -968,6 +968,12 @@ export const OpenClawSchema = z
       .optional(),
     memory: MemorySchema,
     mcp: McpConfigSchema,
+    executionKernel: z
+      .object({
+        enabled: z.boolean().optional(),
+      })
+      .strict()
+      .optional(),
     skills: z
       .object({
         allowBundled: z.array(z.string()).optional(),
