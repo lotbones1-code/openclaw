@@ -13,11 +13,23 @@ import {
   failTaskRunByRunId,
 } from "../../tasks/detached-task-runtime.js";
 import { findTaskByRunId, listTaskRecords } from "../../tasks/runtime-internal.js";
+import { listTaskControlRecords } from "../../tasks/task-control-registry.js";
+import type { JsonValue } from "../../tasks/task-flow-registry.types.js";
+import {
+  createManagedTaskFlow,
+  findLatestTaskFlowForOwnerKey,
+  finishFlow,
+  listTaskFlowRecords,
+  updateFlowRecordByIdExpectedRevision,
+} from "../../tasks/task-flow-runtime-internal.js";
 import type { TaskRecord } from "../../tasks/task-registry.types.js";
 import {
   buildWorkManagerSnapshot,
   createCronWorkCandidate,
   evaluateWorkAdmission,
+  selectMissionRevenueFloorCronJob,
+  type WorkAdmissionDecision,
+  type WorkManagerCandidate,
   type WorkResourceLock,
 } from "../../work-manager/work-manager.js";
 import { clearCronJobActive, isCronJobActive, markCronJobActive } from "../active-jobs.js";
@@ -70,6 +82,9 @@ const DEFAULT_FAILURE_ALERT_COOLDOWN_MS = 60 * 60_000; // 1 hour
 const RECURRING_TIMEOUT_QUARANTINE_AFTER = 3;
 const RUNNING_MARKER_TIMEOUT_RECONCILE_GRACE_MS = 2_000;
 const RUNNING_MARKER_RUN_ID_DRIFT_MS = 5_000;
+const WORK_MANAGER_CONTROLLER_ID = "work-manager";
+const WORK_MANAGER_ADMISSION_RETRY_MS = 60_000;
+const WORK_MANAGER_TIMEOUT_SPLIT_AFTER = 2;
 
 type ResolvedFailureAlert = {
   after: number;
@@ -966,6 +981,7 @@ function applyOutcomeToStoredJob(state: CronServiceState, result: TimedCronRunOu
     startedAt: result.startedAt,
     endedAt: result.endedAt,
   });
+  upsertTimeoutAutoSplitWorkFlow({ state, job, result });
 
   emitJobFinished(state, job, result, result.startedAt);
 
@@ -1069,6 +1085,7 @@ export async function onTimer(state: CronServiceState) {
       const dueCheckNow = state.deps.nowMs();
       const reconciledRunningMarkers = reconcileRunningMarkers(state, dueCheckNow);
       const quarantinedStoredTimeoutLoops = quarantineStoredRecurringTimeoutLoops(state);
+      const promotedMissionRevenueFloor = promoteMissionRevenueFloorJob(state, dueCheckNow);
       const due = collectRunnableJobs(state, dueCheckNow);
       const admitted = filterRunnableJobsByWorkAdmission(state, due, dueCheckNow);
       const admissionDeferred = admitted.length !== due.length;
@@ -1084,6 +1101,7 @@ export async function onTimer(state: CronServiceState) {
         if (
           reconciledRunningMarkers ||
           quarantinedStoredTimeoutLoops ||
+          promotedMissionRevenueFloor ||
           changed ||
           admissionDeferred
         ) {
@@ -1328,6 +1346,62 @@ function collectRunnableJobs(
   );
 }
 
+function promoteMissionRevenueFloorJob(state: CronServiceState, nowMs: number): boolean {
+  if (!state.store) {
+    return false;
+  }
+  const snapshot = buildWorkManagerSnapshot({
+    nowMs,
+    mode: "overnight",
+    tasks: listTaskRecords(),
+    taskFlows: listTaskFlowRecords(),
+    cronJobs: state.store.jobs,
+    reliability: getLatestReliabilityHealthSnapshot(),
+  });
+  const decision = selectMissionRevenueFloorCronJob({
+    snapshot,
+    cronJobs: state.store.jobs,
+    nowMs,
+  });
+  if (decision.decision !== "promote") {
+    return false;
+  }
+  const job = state.store.jobs.find((entry) => entry.id === decision.jobId);
+  if (!job || !isJobEnabled(job) || typeof job.state.runningAtMs === "number") {
+    return false;
+  }
+  job.state.nextRunAtMs = nowMs;
+  job.updatedAtMs = nowMs;
+  upsertMissionRevenueFloorWorkFlow({
+    job,
+    candidate: decision.candidate,
+    missionId: snapshot.activeMission?.mission_id ?? "unknown",
+    nowMs,
+  });
+  state.deps.log.info(
+    {
+      jobId: job.id,
+      missionId: snapshot.activeMission?.mission_id,
+    },
+    "cron: mission revenue floor promoted existing native cron job",
+  );
+  recordReliabilityEvent({
+    subsystem: "cron",
+    code: "mission_revenue_floor_promoted",
+    severity: "info",
+    subject: job.id,
+    message: `cron: mission revenue floor promoted ${job.name}`,
+    recoverable: true,
+    quiet: true,
+    createdAt: nowMs,
+    metadata: {
+      missionId: snapshot.activeMission?.mission_id,
+      jobId: job.id,
+    },
+  });
+  return true;
+}
+
 function filterRunnableJobsByWorkAdmission(
   state: CronServiceState,
   due: CronJob[],
@@ -1341,6 +1415,8 @@ function filterRunnableJobsByWorkAdmission(
     nowMs,
     mode: "admission",
     tasks: listTaskRecords(),
+    taskControls: listTaskControlRecords({ activeOnly: true }),
+    taskFlows: listTaskFlowRecords(),
     cronJobs: state.store.jobs,
     reliability: getLatestReliabilityHealthSnapshot(),
   });
@@ -1358,6 +1434,7 @@ function filterRunnableJobsByWorkAdmission(
     );
 
     if (decision.decision === "allow") {
+      finishAdmissionDeferredWorkFlow(job, candidate, nowMs);
       admitted.push(job);
       for (const resource of candidate.requestedResources) {
         reservedLocks.push({
@@ -1374,7 +1451,14 @@ function filterRunnableJobsByWorkAdmission(
       continue;
     }
 
-    job.state.nextRunAtMs = nowMs + 60_000;
+    job.state.nextRunAtMs = nowMs + WORK_MANAGER_ADMISSION_RETRY_MS;
+    upsertAdmissionDeferredWorkFlow({
+      job,
+      candidate,
+      decision,
+      nowMs,
+      nextRunAtMs: job.state.nextRunAtMs,
+    });
     state.deps.log.info(
       {
         jobId: job.id,
@@ -1401,6 +1485,343 @@ function filterRunnableJobsByWorkAdmission(
   }
 
   return admitted;
+}
+
+function missionRevenueFloorOwnerKey(params: { missionId: string; jobId: string }): string {
+  return `work-manager:mission-floor:${params.missionId}:${params.jobId}`;
+}
+
+function upsertMissionRevenueFloorWorkFlow(params: {
+  job: CronJob;
+  candidate: WorkManagerCandidate;
+  missionId: string;
+  nowMs: number;
+}) {
+  const ownerKey = missionRevenueFloorOwnerKey({
+    missionId: params.missionId,
+    jobId: params.job.id,
+  });
+  const stateJson = {
+    openclawWorkManager: {
+      version: 1,
+      workId: params.candidate.workId,
+      lane: params.candidate.lane,
+      pool: params.candidate.pool,
+      priority: params.candidate.priority,
+      requestedResources: params.candidate.requestedResources,
+      expectedOutput: params.candidate.expectedOutput,
+      proofPath: params.candidate.proofPath,
+      timeoutMs: params.candidate.timeoutMs,
+      owner: params.candidate.owner,
+      workStatus: "succeeded",
+      createdAt: params.nowMs,
+      leaseUntil: params.nowMs,
+      handoffDepth: params.candidate.handoffDepth ?? 0,
+    },
+    openclawQueueDrain: {
+      decision: "dispatch",
+      reason: "mission_revenue_floor",
+      dispatchedAt: params.nowMs,
+    },
+    openclawLastRecoveryAction: `promoted:${params.job.id}`,
+  } satisfies Record<string, JsonValue>;
+  const existing = findLatestTaskFlowForOwnerKey(ownerKey);
+  if (existing && ["queued", "running", "waiting", "blocked"].includes(existing.status)) {
+    finishFlow({
+      flowId: existing.flowId,
+      expectedRevision: existing.revision,
+      currentStep: "mission_revenue_floor_promoted",
+      stateJson,
+      updatedAt: params.nowMs,
+      endedAt: params.nowMs,
+    });
+    return;
+  }
+  createManagedTaskFlow({
+    controllerId: WORK_MANAGER_CONTROLLER_ID,
+    ownerKey,
+    notifyPolicy: "silent",
+    status: "succeeded",
+    goal: `Mission revenue floor promoted ${params.job.name}`,
+    currentStep: "mission_revenue_floor_promoted",
+    stateJson,
+    createdAt: params.nowMs,
+    updatedAt: params.nowMs,
+    endedAt: params.nowMs,
+  });
+}
+
+function workManagerCronOwnerKey(job: CronJob): string {
+  return `work-manager:cron:${job.id}`;
+}
+
+function upsertAdmissionDeferredWorkFlow(params: {
+  job: CronJob;
+  candidate: WorkManagerCandidate;
+  decision: WorkAdmissionDecision;
+  nowMs: number;
+  nextRunAtMs: number;
+}) {
+  if (params.decision.decision === "allow" || !shouldTrackAdmissionDeferredWork(params.candidate)) {
+    return;
+  }
+
+  const ownerKey = workManagerCronOwnerKey(params.job);
+  const existing = findLatestTaskFlowForOwnerKey(ownerKey);
+  const stateJson = buildAdmissionDeferredStateJson({
+    ...params,
+    decision: params.decision,
+  });
+  const activeStatuses = new Set(["queued", "running", "waiting", "blocked"]);
+  if (existing && activeStatuses.has(existing.status)) {
+    updateFlowRecordByIdExpectedRevision({
+      flowId: existing.flowId,
+      expectedRevision: existing.revision,
+      patch: {
+        status: "queued",
+        goal: params.job.name,
+        currentStep: "admission_deferred",
+        blockedTaskId: params.job.id,
+        blockedSummary: `work manager deferred cron job: ${params.decision.reason}`,
+        stateJson,
+        updatedAt: params.nowMs,
+        endedAt: null,
+      },
+    });
+    return;
+  }
+
+  createManagedTaskFlow({
+    controllerId: WORK_MANAGER_CONTROLLER_ID,
+    ownerKey,
+    notifyPolicy: "silent",
+    status: "queued",
+    goal: params.job.name,
+    currentStep: "admission_deferred",
+    blockedTaskId: params.job.id,
+    blockedSummary: `work manager deferred cron job: ${params.decision.reason}`,
+    stateJson,
+    createdAt: params.nowMs,
+    updatedAt: params.nowMs,
+  });
+}
+
+function finishAdmissionDeferredWorkFlow(
+  job: CronJob,
+  candidate: WorkManagerCandidate,
+  nowMs: number,
+) {
+  if (!shouldTrackAdmissionDeferredWork(candidate)) {
+    return;
+  }
+  const existing = findLatestTaskFlowForOwnerKey(workManagerCronOwnerKey(job));
+  if (!existing || !["queued", "running", "waiting", "blocked"].includes(existing.status)) {
+    return;
+  }
+  const stateJson = mergeStateJson(existing.stateJson, {
+    openclawWorkManager: {
+      ...readObject(existing.stateJson, "openclawWorkManager"),
+      workStatus: "succeeded",
+      dispatchedAt: nowMs,
+    },
+    openclawQueueDrain: {
+      decision: "dispatch",
+      reason: "available",
+      dispatchedAt: nowMs,
+    },
+  });
+  finishFlow({
+    flowId: existing.flowId,
+    expectedRevision: existing.revision,
+    currentStep: "dispatched_by_work_manager",
+    stateJson,
+    updatedAt: nowMs,
+    endedAt: nowMs,
+  });
+}
+
+function shouldTrackAdmissionDeferredWork(candidate: WorkManagerCandidate): boolean {
+  return (
+    candidate.priority === "P0_USER_DIRECTIVE" ||
+    candidate.priority === "P0" ||
+    candidate.priority === "P1"
+  );
+}
+
+function buildAdmissionDeferredStateJson(params: {
+  candidate: WorkManagerCandidate;
+  decision: Exclude<WorkAdmissionDecision, { decision: "allow" }>;
+  nowMs: number;
+  nextRunAtMs: number;
+}): JsonValue {
+  return {
+    openclawWorkManager: {
+      version: 1,
+      workId: params.candidate.workId,
+      lane: params.candidate.lane,
+      pool: params.candidate.pool,
+      priority: params.candidate.priority,
+      requestedResources: params.candidate.requestedResources,
+      expectedOutput: params.candidate.expectedOutput,
+      proofPath: params.candidate.proofPath,
+      timeoutMs: params.candidate.timeoutMs,
+      owner: params.candidate.owner,
+      workStatus: "queued",
+      createdAt: params.nowMs,
+      leaseUntil: params.nextRunAtMs,
+      handoffDepth: params.candidate.handoffDepth ?? 0,
+      blockedReason: params.decision.reason,
+      blockedResource: params.decision.resource ?? "",
+      blockedResources: params.decision.blockedResources ?? [],
+      nextDispatchCheckAt: params.nextRunAtMs,
+    },
+    openclawQueueDrain: {
+      decision: "blocked",
+      reason: params.decision.reason,
+      blockedResource: params.decision.resource ?? "",
+      blockedResources: params.decision.blockedResources ?? [],
+      nextDispatchCheckAt: params.nextRunAtMs,
+    },
+  };
+}
+
+function timeoutSplitOwnerKey(job: CronJob): string {
+  return `work-manager:timeout-split:${job.id}`;
+}
+
+function upsertTimeoutAutoSplitWorkFlow(params: {
+  state: CronServiceState;
+  job: CronJob;
+  result: Pick<TimedCronRunOutcome, "status" | "error" | "endedAt">;
+}) {
+  if (
+    params.result.status !== "error" ||
+    params.job.schedule.kind === "at" ||
+    !isTimeoutLikeError(params.result.error) ||
+    (params.job.state.consecutiveErrors ?? 0) < WORK_MANAGER_TIMEOUT_SPLIT_AFTER
+  ) {
+    return;
+  }
+  const nowMs = params.result.endedAt;
+  const baseCandidate = createCronWorkCandidate({
+    job: params.job,
+    nowMs,
+    status: "queued",
+  });
+  const candidate: WorkManagerCandidate = {
+    ...baseCandidate,
+    workId: `timeout-split:${params.job.id}:${nowMs}`,
+    lane: `Narrowed recovery for ${params.job.name}`,
+    expectedOutput: `Shrink the timed-out native cron scope and finish one bounded safe unit for ${params.job.name}.`,
+    proofPath: params.job.id,
+    owner: "work-manager:timeout-split",
+    leaseUntil: nowMs + WORK_MANAGER_ADMISSION_RETRY_MS,
+  };
+  const stateJson = {
+    openclawWorkManager: {
+      version: 1,
+      workId: candidate.workId,
+      lane: candidate.lane,
+      pool: candidate.pool,
+      priority: candidate.priority,
+      requestedResources: candidate.requestedResources,
+      expectedOutput: candidate.expectedOutput,
+      proofPath: candidate.proofPath,
+      timeoutMs: candidate.timeoutMs,
+      owner: candidate.owner,
+      workStatus: "queued",
+      createdAt: nowMs,
+      leaseUntil: candidate.leaseUntil ?? nowMs + WORK_MANAGER_ADMISSION_RETRY_MS,
+      handoffDepth: candidate.handoffDepth ?? 0,
+      blockedReason: "timeout_auto_split",
+      nextDispatchCheckAt: nowMs + WORK_MANAGER_ADMISSION_RETRY_MS,
+    },
+    openclawQueueDrain: {
+      decision: "blocked",
+      reason: "timeout_auto_split",
+      nextDispatchCheckAt: nowMs + WORK_MANAGER_ADMISSION_RETRY_MS,
+    },
+  } satisfies Record<string, JsonValue>;
+  const ownerKey = timeoutSplitOwnerKey(params.job);
+  const existing = findLatestTaskFlowForOwnerKey(ownerKey);
+  const activeStatuses = new Set(["queued", "running", "waiting", "blocked"]);
+  if (existing && activeStatuses.has(existing.status)) {
+    updateFlowRecordByIdExpectedRevision({
+      flowId: existing.flowId,
+      expectedRevision: existing.revision,
+      patch: {
+        status: "queued",
+        goal: candidate.lane,
+        currentStep: "timeout_auto_split_queued",
+        blockedTaskId: params.job.id,
+        blockedSummary: "timed-out cron needs narrowed native recovery unit",
+        stateJson,
+        updatedAt: nowMs,
+        endedAt: null,
+      },
+    });
+    return;
+  }
+  createManagedTaskFlow({
+    controllerId: WORK_MANAGER_CONTROLLER_ID,
+    ownerKey,
+    notifyPolicy: "silent",
+    status: "queued",
+    goal: candidate.lane,
+    currentStep: "timeout_auto_split_queued",
+    blockedTaskId: params.job.id,
+    blockedSummary: "timed-out cron needs narrowed native recovery unit",
+    stateJson,
+    createdAt: nowMs,
+    updatedAt: nowMs,
+  });
+  params.state.deps.log.info(
+    {
+      jobId: params.job.id,
+      consecutiveErrors: params.job.state.consecutiveErrors,
+    },
+    "cron: work manager queued timeout auto-split recovery",
+  );
+  recordReliabilityEvent({
+    subsystem: "cron",
+    code: "timeout_auto_split_queued",
+    severity: "info",
+    subject: params.job.id,
+    message: `cron: queued narrowed recovery for timed-out job ${params.job.name}`,
+    recoverable: true,
+    quiet: true,
+    createdAt: nowMs,
+    metadata: {
+      jobId: params.job.id,
+      consecutiveErrors: params.job.state.consecutiveErrors,
+    },
+  });
+}
+
+function isTimeoutLikeError(error: string | undefined): boolean {
+  return /\b(timeout|timed out|deadline|abort)\b/i.test(error ?? "");
+}
+
+function mergeStateJson(
+  existing: JsonValue | undefined,
+  patch: Record<string, JsonValue>,
+): JsonValue {
+  return {
+    ...(isPlainJsonObject(existing) ? existing : {}),
+    ...patch,
+  };
+}
+
+function readObject(value: JsonValue | undefined, key: string): Record<string, JsonValue> {
+  if (!isPlainJsonObject(value)) {
+    return {};
+  }
+  const child = value[key];
+  return isPlainJsonObject(child) ? child : {};
+}
+
+function isPlainJsonObject(value: unknown): value is Record<string, JsonValue> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 export async function runMissedJobs(

@@ -173,6 +173,39 @@ describe("task-flow-registry audit", () => {
     });
   });
 
+  it("does not flag the active OpenClaw mission contract as a stale worker", async () => {
+    await withTaskFlowAuditStateDir(async () => {
+      const flow = createManagedTaskFlow({
+        ownerKey: "work-manager:mission:current",
+        controllerId: "work-manager",
+        goal: "OpenClaw Mission Contract",
+        status: "running",
+        currentStep: "mission_active",
+        createdAt: 1,
+        updatedAt: 1,
+        stateJson: {
+          openclawMission: {
+            mission_id: "mission-test",
+            status: "active",
+          },
+        },
+      });
+
+      expect(listTaskFlowAuditFindings({ now: 31 * 60_000 })).not.toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            code: "stale_running",
+            flow: expect.objectContaining({ flowId: flow.flowId }),
+          }),
+          expect.objectContaining({
+            code: "missing_linked_tasks",
+            flow: expect.objectContaining({ flowId: flow.flowId }),
+          }),
+        ]),
+      );
+    });
+  });
+
   it("does not flag missing linked tasks before the flow is stale", async () => {
     await withTaskFlowAuditStateDir(async () => {
       const now = Date.now();

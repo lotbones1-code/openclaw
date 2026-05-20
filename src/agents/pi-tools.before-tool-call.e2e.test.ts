@@ -199,6 +199,46 @@ describe("before_tool_call loop detection behavior", () => {
     });
   });
 
+  it("allows checkout and payment surfaces when native policy locks are unlocked", async () => {
+    await withOpenClawTestState(
+      {
+        label: "before-tool-native-sensitive-unlock-surface",
+        applyEnv: true,
+      },
+      async () => {
+        setPolicyLock({
+          lockId: "checkout:mutation",
+          state: "UNLOCKED",
+          source: "test",
+          now: 100,
+        });
+        setPolicyLock({
+          lockId: "payment:order",
+          state: "UNLOCKED",
+          source: "test",
+          now: 100,
+        });
+
+        const result = await runBeforeToolCallHook({
+          toolName: "browser.click",
+          params: {
+            browserProfile: "openclaw-personal",
+            cdpTargetId: "target-1",
+            ownerTaskId: "task-1",
+            url: "https://merchant.example/checkout/payment",
+            action: "review and continue approved checkout",
+          },
+          ctx: {
+            agentId: "main",
+            sessionKey: "agent:main:telegram:personal",
+          },
+        });
+
+        expect(result).toMatchObject({ blocked: false });
+      },
+    );
+  });
+
   it("allows ordinary free SaaS account creation in an OpenClaw-owned browser profile", async () => {
     const result = await runBeforeToolCallHook({
       toolName: "browser.click",

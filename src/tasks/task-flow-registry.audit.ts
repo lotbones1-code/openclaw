@@ -90,6 +90,25 @@ function hasBlockingMetadata(flow: TaskFlowRecord): boolean {
   );
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isActiveOpenClawMissionFlow(flow: TaskFlowRecord): boolean {
+  if (
+    flow.goal !== "OpenClaw Mission Contract" &&
+    flow.ownerKey !== "work-manager:mission:current"
+  ) {
+    return false;
+  }
+  const stateJson = flow.stateJson;
+  const mission = isRecord(stateJson) ? stateJson.openclawMission : undefined;
+  if (!isRecord(mission)) {
+    return false;
+  }
+  return mission.status === "active";
+}
+
 function findTimestampInconsistency(flow: TaskFlowRecord): TaskFlowAuditFinding | null {
   if (flow.updatedAt < flow.createdAt) {
     return createFinding({
@@ -166,7 +185,9 @@ export function listTaskFlowAuditFindings(
       (task) => task.status === "queued" || task.status === "running",
     );
 
-    if (flow.status === "running" && ageMs >= staleRunningMs) {
+    const activeMissionFlow = isActiveOpenClawMissionFlow(flow);
+
+    if (flow.status === "running" && ageMs >= staleRunningMs && !activeMissionFlow) {
       findings.push(
         createFinding({
           severity: "error",
@@ -232,7 +253,8 @@ export function listTaskFlowAuditFindings(
             ? staleWaitingMs
             : staleBlockedMs) &&
       linkedTasks.length === 0 &&
-      !hasBlockingMetadata(flow)
+      !hasBlockingMetadata(flow) &&
+      !activeMissionFlow
     ) {
       findings.push(
         createFinding({

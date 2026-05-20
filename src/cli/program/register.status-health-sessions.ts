@@ -20,7 +20,11 @@ import {
   tasksNotifyCommand,
   tasksShowCommand,
 } from "../../commands/tasks.js";
-import { workShadowCommand, workStatusCommand } from "../../commands/work.js";
+import {
+  workMissionAcceptCommand,
+  workShadowCommand,
+  workStatusCommand,
+} from "../../commands/work.js";
 import { setVerbose } from "../../globals.js";
 import { defaultRuntime } from "../../runtime.js";
 import { formatDocsLink } from "../../terminal/links.js";
@@ -163,6 +167,33 @@ export function registerStatusHealthSessionsCommands(program: Command) {
     .action(async (opts) => {
       await runCommandWithRuntime(defaultRuntime, async () => {
         await workShadowCommand({ json: Boolean(opts.json) }, defaultRuntime);
+      });
+    });
+
+  const workMissionCmd = workCmd
+    .command("mission")
+    .description("Manage native Work Manager mission contracts");
+
+  workMissionCmd
+    .command("accept")
+    .description("Accept a native mission contract backed by TaskFlow")
+    .requiredOption("--request <text>", "Original user request")
+    .requiredOption("--selected-option <text>", "Selected option or objective to execute")
+    .option("--wake-time <iso>", "Mission wake/stop time as ISO timestamp")
+    .option("--proof-path <path>", "Mission proof/report path")
+    .option("--json", "Output JSON instead of text", false)
+    .action(async (opts) => {
+      await runCommandWithRuntime(defaultRuntime, async () => {
+        await workMissionAcceptCommand(
+          {
+            request: opts.request as string,
+            selectedOption: opts.selectedOption as string,
+            wakeTime: opts.wakeTime as string | undefined,
+            proofPath: opts.proofPath as string | undefined,
+            json: Boolean(opts.json),
+          },
+          defaultRuntime,
+        );
       });
     });
 

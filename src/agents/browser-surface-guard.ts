@@ -1,4 +1,5 @@
 import { normalizeOptionalString } from "../shared/string-coerce.js";
+import { getPolicyLock } from "../tasks/policy-lock-registry.js";
 import { isPlainObject } from "../utils.js";
 
 export type BrowserSurfaceGuardDecision =
@@ -133,6 +134,58 @@ function hasTruthyApproval(value: unknown): boolean {
   return false;
 }
 
+function sensitiveSurfaceLockIds(strings: string[]): string[] {
+  const joined = strings.join("\n").toLowerCase();
+  const lockIds = new Set<string>();
+  if (
+    includesPattern(joined, [
+      "account/recovery",
+      "account/security",
+      "security settings",
+      "security center",
+      "password reset",
+      "reset password",
+      "password change",
+      "change password",
+      "two-factor",
+      "two factor",
+      "2fa",
+      "mfa",
+      "passkey",
+    ])
+  ) {
+    lockIds.add("account:security");
+  }
+  if (includesPattern(joined, ["refund", "return"])) {
+    lockIds.add("payment:refund");
+  }
+  if (includesPattern(joined, ["checkout"])) {
+    lockIds.add("checkout:mutation");
+  }
+  if (
+    includesPattern(joined, [
+      "amazon.",
+      "/orders",
+      "order-history",
+      "your-orders",
+      "payment",
+      "subscription",
+      "billing",
+    ])
+  ) {
+    lockIds.add("payment:order");
+  }
+  return [...lockIds];
+}
+
+function hasUnlockedNativeSensitiveSurface(strings: string[]): boolean {
+  const lockIds = sensitiveSurfaceLockIds(strings);
+  if (lockIds.length === 0) {
+    return false;
+  }
+  return lockIds.every((lockId) => getPolicyLock(lockId)?.state === "UNLOCKED");
+}
+
 function getStringField(value: unknown, key: string): string | undefined {
   if (!isPlainObject(value)) {
     return undefined;
@@ -229,7 +282,11 @@ export function evaluateBrowserSurfaceGuard(params: {
     };
   }
 
-  if (hasSensitiveSurface(strings) && !hasTruthyApproval(params.toolParams)) {
+  if (
+    hasSensitiveSurface(strings) &&
+    !hasTruthyApproval(params.toolParams) &&
+    !hasUnlockedNativeSensitiveSurface(strings)
+  ) {
     return {
       blocked: true,
       code: "SENSITIVE_ACCOUNT_SURFACE_GATE",

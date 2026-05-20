@@ -9,6 +9,7 @@ import {
   setDetachedTaskLifecycleRuntime,
   getDetachedTaskLifecycleRuntime,
 } from "./detached-task-runtime.js";
+import type { TaskControlRecord } from "./task-control-registry.js";
 import {
   previewTaskRegistryMaintenance,
   reconcileInspectableTasks,
@@ -59,6 +60,7 @@ function createTaskRegistryMaintenanceHarness(params: {
   cronStore?: CronStoreFile;
   cronRunLogEntries?: Record<string, CronRunLogEntry[]>;
   cronRuntimeAuthoritative?: boolean;
+  taskControls?: TaskControlRecord[];
 }) {
   const sessionStore = params.sessionStore ?? {};
   const acpEntry = params.acpEntry;
@@ -154,6 +156,8 @@ function createTaskRegistryMaintenanceHarness(params: {
     loadCronStoreSync: () => params.cronStore ?? { version: 1, jobs: [] },
     resolveCronRunLogPath: ({ jobId }) => jobId,
     readCronRunLogEntriesSync: (jobId) => cronRunLogEntries[jobId] ?? [],
+    listTaskControlRecords: (opts = {}) =>
+      (params.taskControls ?? []).filter((record) => !opts.state || record.state === opts.state),
   };
 
   setTaskRegistryMaintenanceRuntimeForTests(runtime);
@@ -161,6 +165,50 @@ function createTaskRegistryMaintenanceHarness(params: {
 }
 
 describe("task-registry maintenance issue #60299", () => {
+  it("marks active tasks cancelled when a contained native stop control already owns them", async () => {
+    const childSessionKey = "agent:main:subagent:contained-stop";
+    const task = makeStaleTask({
+      runtime: "subagent",
+      taskId: "contained-task",
+      runId: "contained-run",
+      childSessionKey,
+      requesterSessionKey: "agent:main:telegram:direct:6032869886",
+    });
+
+    const { currentTasks } = createTaskRegistryMaintenanceHarness({
+      tasks: [task],
+      sessionStore: { [childSessionKey]: { sessionId: childSessionKey, updatedAt: Date.now() } },
+      taskControls: [
+        {
+          controlId: "control-contained",
+          command: "stop",
+          scope: "task:contained-task",
+          taskId: "contained-task",
+          runId: "contained-run",
+          sessionKey: childSessionKey,
+          source: "test",
+          reason: "contained stop",
+          requestedAt: Date.now() - 1_000,
+          containedAt: Date.now(),
+          state: "contained",
+          resumeCondition: "explicit_resume",
+        },
+      ],
+    });
+
+    expect(reconcileInspectableTasks()[0]).toMatchObject({
+      taskId: "contained-task",
+      status: "cancelled",
+      error: "stopped by native task control",
+    });
+    expect(previewTaskRegistryMaintenance()).toMatchObject({ reconciled: 1 });
+    expect(await runTaskRegistryMaintenance()).toMatchObject({ reconciled: 1 });
+    expect(currentTasks.get(task.taskId)).toMatchObject({
+      status: "cancelled",
+      error: "stopped by native task control",
+    });
+  });
+
   it("marks stale cron tasks lost once the runtime no longer tracks the job as active", async () => {
     const childSessionKey = "agent:main:workspace:channel:test-channel";
     const task = makeStaleTask({
@@ -361,6 +409,28 @@ describe("task-registry maintenance issue #60299", () => {
       sessionStore: { [channelKey]: { sessionId: channelKey, updatedAt: Date.now() } },
     });
 
+    expect(await runTaskRegistryMaintenance()).toMatchObject({ reconciled: 1 });
+    expect(currentTasks.get(task.taskId)).toMatchObject({ status: "lost" });
+  });
+
+  it("marks subagent child cli tasks lost after the owning run context disappears", async () => {
+    const childSessionKey = "agent:main:subagent:stale-cli-child";
+    const task = makeStaleTask({
+      runtime: "cli",
+      taskId: "stale-cli-task",
+      sourceId: "run-subagent-cli-stale",
+      runId: "run-subagent-cli-stale",
+      ownerKey: childSessionKey,
+      requesterSessionKey: childSessionKey,
+      childSessionKey,
+    });
+
+    const { currentTasks } = createTaskRegistryMaintenanceHarness({
+      tasks: [task],
+      sessionStore: { [childSessionKey]: { sessionId: childSessionKey, updatedAt: Date.now() } },
+    });
+
+    expect(previewTaskRegistryMaintenance()).toMatchObject({ reconciled: 1 });
     expect(await runTaskRegistryMaintenance()).toMatchObject({ reconciled: 1 });
     expect(currentTasks.get(task.taskId)).toMatchObject({ status: "lost" });
   });

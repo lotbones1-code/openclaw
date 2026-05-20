@@ -7,7 +7,6 @@ import { loadCronStoreSync, resolveCronStorePath } from "../cron/store.js";
 import type { CronJob, CronStoreFile } from "../cron/types.js";
 import { getAgentRunContext } from "../infra/agent-events.js";
 import { parseAgentSessionKey } from "../routing/session-key.js";
-import { deriveSessionChatType } from "../sessions/session-chat-type.js";
 import { normalizeLowercaseStringOrEmpty } from "../shared/string-coerce.js";
 import { tryRecoverTaskBeforeMarkLost } from "./detached-task-runtime.js";
 import {
@@ -21,6 +20,11 @@ import {
   resolveTaskForLookupToken,
   setTaskCleanupAfterById,
 } from "./runtime-internal.js";
+import {
+  listTaskControlRecords,
+  type TaskControlCommand,
+  type TaskControlRecord,
+} from "./task-control-registry.js";
 import {
   configureTaskAuditTaskProvider,
   listTaskAuditFindings,
@@ -68,6 +72,7 @@ type TaskRegistryMaintenanceRuntime = {
   loadCronStoreSync: typeof loadCronStoreSync;
   resolveCronRunLogPath: typeof resolveCronRunLogPath;
   readCronRunLogEntriesSync: typeof readCronRunLogEntriesSync;
+  listTaskControlRecords: typeof listTaskControlRecords;
 };
 
 const defaultTaskRegistryMaintenanceRuntime: TaskRegistryMaintenanceRuntime = {
@@ -91,6 +96,7 @@ const defaultTaskRegistryMaintenanceRuntime: TaskRegistryMaintenanceRuntime = {
   loadCronStoreSync,
   resolveCronRunLogPath,
   readCronRunLogEntriesSync,
+  listTaskControlRecords,
 };
 
 let taskRegistryMaintenanceRuntime: TaskRegistryMaintenanceRuntime =
@@ -358,6 +364,10 @@ function hasBackingSession(task: TaskRecord): boolean {
     return true;
   }
 
+  if (task.runtime === "cli") {
+    return false;
+  }
+
   const childSessionKey = task.childSessionKey?.trim();
   if (!childSessionKey) {
     return true;
@@ -371,13 +381,7 @@ function hasBackingSession(task: TaskRecord): boolean {
     }
     return Boolean(acpEntry.entry);
   }
-  if (task.runtime === "subagent" || task.runtime === "cli") {
-    if (task.runtime === "cli") {
-      const chatType = deriveSessionChatType(childSessionKey);
-      if (chatType === "channel" || chatType === "group" || chatType === "direct") {
-        return false;
-      }
-    }
+  if (task.runtime === "subagent") {
     const agentId = taskRegistryMaintenanceRuntime.parseAgentSessionKey(childSessionKey)?.agentId;
     const storePath = taskRegistryMaintenanceRuntime.resolveStorePath(undefined, { agentId });
     const store = taskRegistryMaintenanceRuntime.loadSessionStore(storePath);
@@ -385,6 +389,42 @@ function hasBackingSession(task: TaskRecord): boolean {
   }
 
   return true;
+}
+
+function commandIsStopLike(command: TaskControlCommand): boolean {
+  return (
+    command === "stop" ||
+    command === "pause" ||
+    command === "cancel" ||
+    command === "stop_browser" ||
+    command === "stop_social" ||
+    command === "stop_personal_assistant" ||
+    command === "red_stop_all"
+  );
+}
+
+function containedStopControlForTask(task: TaskRecord): TaskControlRecord | undefined {
+  if (!isActiveTask(task)) {
+    return undefined;
+  }
+  return taskRegistryMaintenanceRuntime
+    .listTaskControlRecords({ state: "contained" })
+    .find((record) => {
+      if (!commandIsStopLike(record.command)) {
+        return false;
+      }
+      if (record.scope === "global" || record.command === "red_stop_all") {
+        return true;
+      }
+      return Boolean(
+        (record.taskId && record.taskId === task.taskId) ||
+        (record.runId && record.runId === task.runId) ||
+        (record.sessionKey &&
+          (record.sessionKey === task.childSessionKey ||
+            record.sessionKey === task.requesterSessionKey ||
+            record.sessionKey === task.ownerKey)),
+      );
+    });
 }
 
 function shouldMarkLost(task: TaskRecord, now: number): boolean {
@@ -395,6 +435,31 @@ function shouldMarkLost(task: TaskRecord, now: number): boolean {
     return false;
   }
   return !hasBackingSession(task);
+}
+
+function markTaskStoppedByContainedControl(
+  task: TaskRecord,
+  control: TaskControlRecord,
+  now: number,
+): TaskRecord {
+  const endedAt = task.endedAt ?? control.containedAt ?? now;
+  const updated = taskRegistryMaintenanceRuntime.markTaskTerminalById({
+    taskId: task.taskId,
+    status: "cancelled",
+    endedAt,
+    lastEventAt: now,
+    error: task.error ?? "stopped by native task control",
+    terminalSummary: `Task contained by native ${control.command} control ${control.controlId}.`,
+  }) ?? {
+    ...task,
+    status: "cancelled",
+    endedAt,
+    lastEventAt: now,
+    error: task.error ?? "stopped by native task control",
+    terminalSummary: `Task contained by native ${control.command} control ${control.controlId}.`,
+  };
+  void taskRegistryMaintenanceRuntime.maybeDeliverTaskTerminalUpdate(updated.taskId);
+  return updated;
 }
 
 function shouldPruneTerminalTask(task: TaskRecord, now: number): boolean {
@@ -486,6 +551,17 @@ export function reconcileTaskRecordForOperatorInspection(
   task: TaskRecord,
   context: CronRecoveryContext = createCronRecoveryContext(),
 ): TaskRecord {
+  const containedControl = containedStopControlForTask(task);
+  if (containedControl) {
+    return {
+      ...task,
+      status: "cancelled",
+      endedAt: task.endedAt ?? containedControl.containedAt ?? Date.now(),
+      lastEventAt: task.lastEventAt,
+      error: task.error ?? "stopped by native task control",
+      terminalSummary: `Task contained by native ${containedControl.command} control ${containedControl.controlId}.`,
+    };
+  }
   const cronRecovery = resolveDurableCronTaskRecovery(task, context);
   if (cronRecovery) {
     return projectTaskRecovered(task, cronRecovery);
@@ -534,6 +610,10 @@ export function previewTaskRegistryMaintenance(): TaskRegistryMaintenanceSummary
   let pruned = 0;
   const cronRecoveryContext = createCronRecoveryContext();
   for (const task of taskRegistryMaintenanceRuntime.listTaskRecords()) {
+    if (containedStopControlForTask(task)) {
+      reconciled += 1;
+      continue;
+    }
     if (resolveDurableCronTaskRecovery(task, cronRecoveryContext)) {
       recovered += 1;
       continue;
@@ -586,6 +666,16 @@ export async function runTaskRegistryMaintenance(): Promise<TaskRegistryMaintena
   for (const task of tasks) {
     const current = taskRegistryMaintenanceRuntime.getTaskById(task.taskId);
     if (!current) {
+      continue;
+    }
+    const containedControl = containedStopControlForTask(current);
+    if (containedControl) {
+      markTaskStoppedByContainedControl(current, containedControl, now);
+      reconciled += 1;
+      processed += 1;
+      if (processed % SWEEP_YIELD_BATCH_SIZE === 0) {
+        await yieldToEventLoop();
+      }
       continue;
     }
     const cronRecovery = resolveDurableCronTaskRecovery(current, cronRecoveryContext);

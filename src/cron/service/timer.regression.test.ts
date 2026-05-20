@@ -17,7 +17,13 @@ import {
   createRunningTaskRun,
   failTaskRunByRunId,
 } from "../../tasks/detached-task-runtime.js";
+import {
+  createManagedTaskFlow,
+  listTaskFlowRecords,
+  resetTaskFlowRegistryForTests,
+} from "../../tasks/task-flow-runtime-internal.js";
 import { resetTaskRegistryForTests } from "../../tasks/task-registry.js";
+import { buildOpenClawMissionContract } from "../../work-manager/work-manager.js";
 import { createCronExecutionId } from "../run-id.js";
 import * as schedule from "../schedule.js";
 import type { CronJob } from "../types.js";
@@ -39,6 +45,7 @@ const timerRegressionFixtures = setupCronRegressionFixtures({
 
 afterEach(() => {
   resetTaskRegistryForTests({ persist: false });
+  resetTaskFlowRegistryForTests({ persist: false });
 });
 
 function createCronTaskLedger(params: {
@@ -1517,6 +1524,173 @@ describe("cron service timer regressions", () => {
     const jobs = state.store?.jobs ?? [];
     expect(jobs.find((job) => job.id === first.id)?.state.lastStatus).toBe("ok");
     expect(jobs.find((job) => job.id === second.id)?.state.lastStatus).toBe("ok");
+  });
+
+  it("records admission-deferred P0/P1 cron work as managed TaskFlow queue metadata", async () => {
+    const store = timerRegressionFixtures.makeStorePath();
+    const dueAt = Date.parse("2026-02-15T12:00:00.000Z");
+    const first = createDueIsolatedJob({
+      id: "titan-active",
+      nowMs: dueAt,
+      nextRunAtMs: dueAt,
+    });
+    first.name = "Titan Brand Comment Lane";
+    first.payload = { kind: "agentTurn", message: "Use titan-ig for one safe revenue comment" };
+    const second = createDueIsolatedJob({
+      id: "titan-deferred",
+      nowMs: dueAt,
+      nextRunAtMs: dueAt,
+    });
+    second.name = "Titan Buyer Signal Followup";
+    second.payload = { kind: "agentTurn", message: "Use titan-ig for one buyer signal reply" };
+    await writeCronJobs(store.storePath, [first, second]);
+
+    let now = dueAt;
+    const state = createCronServiceState({
+      cronEnabled: true,
+      storePath: store.storePath,
+      log: noopLogger,
+      nowMs: () => now,
+      enqueueSystemEvent: vi.fn(),
+      requestHeartbeatNow: vi.fn(),
+      runIsolatedAgentJob: vi.fn(async () => {
+        now += 10;
+        return { status: "ok", summary: "done" };
+      }),
+    });
+
+    await onTimer(state);
+
+    const queued = listTaskFlowRecords().find(
+      (flow) => flow.ownerKey === "work-manager:cron:titan-deferred",
+    );
+    expect(queued).toMatchObject({
+      syncMode: "managed",
+      controllerId: "work-manager",
+      status: "queued",
+      goal: "Titan Buyer Signal Followup",
+    });
+    expect(queued?.stateJson).toMatchObject({
+      openclawWorkManager: {
+        workStatus: "queued",
+        priority: "P0",
+        blockedReason: "resource_locked",
+        blockedResources: expect.arrayContaining(["browser_profile:titan-ig"]),
+      },
+    });
+  });
+
+  it("promotes an existing safe revenue cron when an active mission would otherwise idle", async () => {
+    resetTaskFlowRegistryForTests();
+    const store = timerRegressionFixtures.makeStorePath();
+    const now = Date.parse("2026-02-15T12:30:00.000Z");
+    const revenue = createIsolatedRegressionJob({
+      id: "native-inbox-dm-triage",
+      name: "Native Inbox + DM Triage — revenue buyer signals",
+      scheduledAt: now + 30 * 60_000,
+      schedule: { kind: "every", everyMs: 30 * 60_000, anchorMs: now },
+      payload: {
+        kind: "agentTurn",
+        message: "Check buyer signals, attribution gaps, and next safe revenue action",
+      },
+      state: { nextRunAtMs: now + 30 * 60_000 },
+    });
+    await writeCronJobs(store.storePath, [revenue]);
+    createManagedTaskFlow({
+      controllerId: "work-manager",
+      ownerKey: "work-manager:mission:current",
+      notifyPolicy: "silent",
+      status: "running",
+      goal: "OpenClaw Mission Contract",
+      currentStep: "mission_active",
+      stateJson: {
+        openclawMission: buildOpenClawMissionContract({
+          missionId: "mission-revenue-floor-runtime",
+          userRequest: "keep working until sale",
+          selectedOption: "run the next highest-priority safe revenue unit",
+          nowMs: now,
+          wakeTime: "2026-02-16T14:00:00.000Z",
+          proofPath: "/tmp/mission-revenue-floor-runtime.md",
+        }),
+      },
+      createdAt: now,
+      updatedAt: now,
+    });
+    const runIsolatedAgentJob = vi.fn(async () => ({ status: "ok" as const, summary: "done" }));
+    const state = createCronServiceState({
+      cronEnabled: true,
+      storePath: store.storePath,
+      log: noopLogger,
+      nowMs: () => now,
+      enqueueSystemEvent: vi.fn(),
+      requestHeartbeatNow: vi.fn(),
+      runIsolatedAgentJob,
+    });
+
+    await onTimer(state);
+
+    expect(runIsolatedAgentJob).toHaveBeenCalledTimes(1);
+    expect(runIsolatedAgentJob.mock.calls[0]?.[0]?.job.id).toBe("native-inbox-dm-triage");
+    expect(
+      listTaskFlowRecords().some(
+        (flow) =>
+          flow.ownerKey ===
+            "work-manager:mission-floor:mission-revenue-floor-runtime:native-inbox-dm-triage" &&
+          flow.status === "succeeded",
+      ),
+    ).toBe(true);
+  });
+
+  it("queues a narrowed native timeout recovery after repeated cron timeouts", async () => {
+    resetTaskFlowRegistryForTests();
+    const store = timerRegressionFixtures.makeStorePath();
+    const dueAt = Date.parse("2026-02-15T13:00:00.000Z");
+    const job = createIsolatedRegressionJob({
+      id: "native-inbox-timeout",
+      name: "Native Inbox + DM Triage — revenue buyer signals",
+      scheduledAt: dueAt,
+      schedule: { kind: "every", everyMs: 30 * 60_000, anchorMs: dueAt - 30 * 60_000 },
+      payload: {
+        kind: "agentTurn",
+        message: "Check buyer signals, attribution gaps, and next safe revenue action",
+      },
+      state: {
+        nextRunAtMs: dueAt,
+        consecutiveErrors: 1,
+      },
+    });
+    await writeCronJobs(store.storePath, [job]);
+    const state = createCronServiceState({
+      cronEnabled: true,
+      storePath: store.storePath,
+      log: noopLogger,
+      nowMs: () => dueAt,
+      enqueueSystemEvent: vi.fn(),
+      requestHeartbeatNow: vi.fn(),
+      runIsolatedAgentJob: vi.fn(async () => ({
+        status: "error" as const,
+        error: "cron: job execution timed out",
+      })),
+    });
+
+    await onTimer(state);
+
+    const queued = listTaskFlowRecords().find(
+      (flow) => flow.ownerKey === "work-manager:timeout-split:native-inbox-timeout",
+    );
+    expect(queued).toMatchObject({
+      syncMode: "managed",
+      controllerId: "work-manager",
+      status: "queued",
+      currentStep: "timeout_auto_split_queued",
+      blockedTaskId: "native-inbox-timeout",
+    });
+    expect(queued?.stateJson).toMatchObject({
+      openclawWorkManager: {
+        workStatus: "queued",
+        blockedReason: "timeout_auto_split",
+      },
+    });
   });
 
   it("outer cron timeout fires at configured timeoutSeconds, not at 1/3 (#29774)", async () => {
