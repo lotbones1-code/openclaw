@@ -216,7 +216,11 @@ export function evaluateBrowserSurfaceGuard(params: {
     return { blocked: false };
   }
 
-  if (hasHumanSurface(strings) && !hasExplicitOpenClawOwner(params.toolParams)) {
+  if (
+    hasHumanSurface(strings) &&
+    !hasExplicitOpenClawOwner(params.toolParams) &&
+    !hasExactOwnerDirectApproval(params.toolParams)
+  ) {
     return {
       blocked: true,
       code: "WRONG_SURFACE_DETECTED",

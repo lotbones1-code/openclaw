@@ -150,6 +150,33 @@ describe("before_tool_call loop detection behavior", () => {
     });
   });
 
+  it("allows human-surface browser action under exact owner-direct approval", async () => {
+    const result = await runBeforeToolCallHook({
+      toolName: "browser.click",
+      params: {
+        browserProfile: "user",
+        url: "https://higgsfield.example.com/starter",
+        action: "complete owner-approved starter plan signup on assigned surface",
+        taskId: "higgsfield-starter-purchase-v2-scope-elevated",
+        lane: "owner_direct_purchase",
+        account: "higgsfield",
+        targetClass: "approved_purchase_signup",
+        ownerDirectApproval: true,
+        approvalText:
+          "Shamil explicitly authorized using the named foreground browser to buy with my card for this exact task.",
+        proofPath: "/tmp/openclaw-owner-approved-higgsfield.md",
+        stopInstruction: "Stop if price, item, merchant, or surface differs from approval.",
+        rollbackInstruction: "Cancel before submit if details differ; record receipt after submit.",
+      },
+      ctx: {
+        agentId: "main",
+        sessionKey: "agent:main:telegram:personal",
+      },
+    });
+
+    expect(result).toMatchObject({ blocked: false });
+  });
+
   it("blocks sensitive account surfaces without exact scoped approval", async () => {
     const result = await runBeforeToolCallHook({
       toolName: "browser.navigate",
