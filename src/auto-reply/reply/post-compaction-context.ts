@@ -21,6 +21,31 @@ const DEFAULT_POST_COMPACTION_SECTIONS = [
 ];
 const LEGACY_POST_COMPACTION_SECTIONS = ["Every Session", "Safety"];
 const LEGACY_SESSION_STARTUP_SECTIONS = ["Session Startup", "Red Lines"];
+const CRITICAL_POST_COMPACTION_SECTIONS = [
+  "Authority Order",
+  "Native Only",
+  "Stop And Interrupt",
+  "Proof And Reporting",
+  "Selected Option Fidelity",
+  "Typed Gates",
+  "Safe Work Continues",
+  "Learning OS",
+  "Self-Builder Discipline",
+] as const;
+const CRITICAL_POST_COMPACTION_ALIASES: Record<
+  (typeof CRITICAL_POST_COMPACTION_SECTIONS)[number],
+  string[]
+> = {
+  "Authority Order": ["Authority Order"],
+  "Native Only": ["Native Only"],
+  "Stop And Interrupt": ["Stop And Interrupt"],
+  "Proof And Reporting": ["Proof And Reporting"],
+  "Selected Option Fidelity": ["Selected Option Fidelity", "Execution Kernel"],
+  "Typed Gates": ["Typed Gates", "Execution Kernel"],
+  "Safe Work Continues": ["Safe Work Continues", "Always-On Directive Drain"],
+  "Learning OS": ["Learning OS", "Learning And Success Notes"],
+  "Self-Builder Discipline": ["Self-Builder Discipline", "Self-Builder Contract"],
+};
 
 // Compare configured section names as a case-insensitive set so deployments can
 // pin the documented defaults in any order without changing fallback semantics.
@@ -65,6 +90,14 @@ function formatDateStamp(nowMs: number, timezone: string): string {
     return `${year}-${month}-${day}`;
   }
   return new Date(nowMs).toISOString().slice(0, 10);
+}
+
+function resolveMissingPostCompactionCriticalSections(foundSectionNames: string[]): string[] {
+  const found = new Set(foundSectionNames.map((name) => normalizeLowercaseStringOrEmpty(name)));
+  return CRITICAL_POST_COMPACTION_SECTIONS.filter((section) => {
+    const aliases = CRITICAL_POST_COMPACTION_ALIASES[section] ?? [section];
+    return !aliases.some((alias) => found.has(normalizeLowercaseStringOrEmpty(alias)));
+  });
 }
 
 /**
@@ -148,6 +181,15 @@ export async function readPostCompactionContext(
 
     if (sections.length === 0) {
       return null;
+    }
+    if (isContextAuthorityEnabled(cfg) && isDefaultSections) {
+      const missingCriticalSections =
+        resolveMissingPostCompactionCriticalSections(foundSectionNames);
+      if (missingCriticalSections.length > 0) {
+        throw new Error(
+          `BOOTSTRAP_CRITICAL_AUTHORITY_INVALID: post-compaction critical authority missing required sections (${missingCriticalSections.join(", ")}). Compact or split authority before injection.`,
+        );
+      }
     }
 
     // Only reference section names that were actually found and injected.

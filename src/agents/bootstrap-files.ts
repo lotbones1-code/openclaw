@@ -303,7 +303,10 @@ function extractMarkdownHeadings(content: string): Set<string> {
 function resolveMissingCriticalAuthoritySections(files: WorkspaceBootstrapFile[]): string[] {
   const agents = files.find((file) => file.name === DEFAULT_AGENTS_FILENAME && !file.missing);
   if (!agents?.content) {
-    return [...CRITICAL_AUTHORITY_REQUIRED_SECTIONS];
+    // Lightweight cron/default runs intentionally inject no bootstrap files.
+    // Context authority validation should fail incomplete authority when it is
+    // present, not turn intentionally empty lightweight context into a hard gate.
+    return [];
   }
   const headings = extractMarkdownHeadings(agents.content);
   return CRITICAL_AUTHORITY_REQUIRED_SECTIONS.filter((section) => {

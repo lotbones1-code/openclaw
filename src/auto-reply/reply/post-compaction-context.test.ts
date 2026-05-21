@@ -123,6 +123,27 @@ Not relevant.
     ).rejects.toThrow(/BOOTSTRAP_CRITICAL_AUTHORITY_INVALID/);
   });
 
+  it("fails with an exact gate when default compact authority sections are incomplete", async () => {
+    fs.writeFileSync(
+      path.join(tmpDir, "AGENTS.md"),
+      [
+        "# AGENTS.md",
+        "",
+        "## Authority Order",
+        "Latest instruction wins.",
+        "",
+        "## Native Only",
+        "No wrappers.",
+      ].join("\n"),
+    );
+
+    await expect(
+      readPostCompactionContext(tmpDir, {
+        cfg: { executionKernel: { contextAuthority: { enabled: true } } } as never,
+      }),
+    ).rejects.toThrow(/BOOTSTRAP_CRITICAL_AUTHORITY_INVALID.*Stop And Interrupt/);
+  });
+
   it("extracts Red Lines section", async () => {
     const content = `# Rules
 

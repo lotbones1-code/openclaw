@@ -248,6 +248,24 @@ describe("resolveBootstrapContextForRun", () => {
     ).rejects.toThrow(/BOOTSTRAP_CRITICAL_AUTHORITY_INVALID.*Stop And Interrupt/);
   });
 
+  it("does not hard-gate intentionally empty lightweight cron bootstrap context", async () => {
+    const workspaceDir = await makeTempWorkspace("openclaw-bootstrap-lightweight-cron-");
+    await fs.writeFile(path.join(workspaceDir, "AGENTS.md"), compactRootAuthority(), "utf8");
+
+    const result = await resolveBootstrapContextForRun({
+      workspaceDir,
+      contextMode: "lightweight",
+      runKind: "cron",
+      config: {
+        executionKernel: { contextAuthority: { enabled: true } },
+        agents: { defaults: { bootstrapMaxChars: 20_000 } },
+      } as never,
+    });
+
+    expect(result.bootstrapFiles).toHaveLength(0);
+    expect(result.contextFiles).toHaveLength(0);
+  });
+
   it("uses heartbeat-only bootstrap files in lightweight heartbeat mode", async () => {
     const workspaceDir = await makeTempWorkspace("openclaw-bootstrap-");
     await fs.writeFile(path.join(workspaceDir, "HEARTBEAT.md"), "check inbox", "utf8");
