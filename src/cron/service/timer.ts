@@ -2471,13 +2471,18 @@ async function planStartupCatchup(
     const now = state.deps.nowMs();
     const reconciledRunningMarkers = reconcileRunningMarkers(state, now);
     const quarantinedStoredTimeoutLoops = quarantineStoredRecurringTimeoutLoops(state);
+    const missionRuntimeTick = applyMissionRuntimeTick(state, now);
+    const skipJobIds =
+      missionRuntimeTick.skipJobIds.size > 0 || opts?.skipJobIds
+        ? new Set([...(opts?.skipJobIds ?? []), ...missionRuntimeTick.skipJobIds])
+        : undefined;
     const missed = collectRunnableJobs(state, now, {
-      skipJobIds: opts?.skipJobIds,
+      skipJobIds,
       skipAtIfAlreadyRan: true,
       allowCronMissedRunByLastRun: true,
     });
     if (missed.length === 0) {
-      if (reconciledRunningMarkers || quarantinedStoredTimeoutLoops) {
+      if (reconciledRunningMarkers || quarantinedStoredTimeoutLoops || missionRuntimeTick.changed) {
         await persist(state);
       }
       return { candidates: [], deferredJobIds: [] };
@@ -2612,8 +2617,9 @@ export async function runDueJobs(state: CronServiceState) {
   }
   const now = state.deps.nowMs();
   const reconciledRunningMarkers = reconcileRunningMarkers(state, now);
-  const due = collectRunnableJobs(state, now);
-  if (reconciledRunningMarkers) {
+  const missionRuntimeTick = applyMissionRuntimeTick(state, now);
+  const due = collectRunnableJobs(state, now, { skipJobIds: missionRuntimeTick.skipJobIds });
+  if (reconciledRunningMarkers || missionRuntimeTick.changed) {
     await persist(state);
   }
   for (const job of due) {

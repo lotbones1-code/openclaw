@@ -1356,6 +1356,57 @@ describe("cron service timer regressions", () => {
     }
   });
 
+  it("routes startup catch-up through Mission Runtime instead of running every missed lane", async () => {
+    const store = timerRegressionFixtures.makeStorePath();
+    const nowMs = Date.parse("2026-05-21T12:30:00.000Z");
+    const target = {
+      ...createDueIsolatedJob({ id: "startup-target", nowMs, nextRunAtMs: nowMs }),
+      name: "Target Enrichment + CRO",
+      payload: { kind: "agentTurn", message: "Find buyer targets and CRO proof" },
+    } as CronJob;
+    const content = {
+      ...createDueIsolatedJob({ id: "startup-content", nowMs, nextRunAtMs: nowMs }),
+      name: "Content Factory",
+      payload: { kind: "agentTurn", message: "Create content packet" },
+    } as CronJob;
+    const wallet = {
+      ...createDueIsolatedJob({ id: "startup-wallet", nowMs, nextRunAtMs: nowMs }),
+      name: "Titan Wallet Watcher",
+      payload: { kind: "agentTurn", message: "Read wallet status" },
+    } as CronJob;
+    await writeCronJobs(store.storePath, [target, content, wallet]);
+    const runIsolatedAgentJob = createDefaultIsolatedRunner();
+    const state = createCronServiceState({
+      cronEnabled: true,
+      storePath: store.storePath,
+      log: noopLogger,
+      nowMs: () => nowMs,
+      executionKernel: {
+        missionRuntime: {
+          enabled: true,
+          mode: "active",
+          standingCompanyDirective: true,
+          suppressLaneAutonomy: true,
+        },
+      },
+      enqueueSystemEvent: vi.fn(),
+      requestHeartbeatNow: vi.fn(),
+      runIsolatedAgentJob,
+    });
+
+    await runMissedJobs(state);
+
+    const calledJobIds = vi.mocked(runIsolatedAgentJob).mock.calls.map(([params]) => params.job.id);
+    expect(calledJobIds).toContain("startup-target");
+    expect(calledJobIds).toContain("startup-wallet");
+    expect(calledJobIds).not.toContain("startup-content");
+    expect(
+      listTaskFlowRecords().some((record) =>
+        record.ownerKey.includes("mission-runtime:suppressed:startup-content"),
+      ),
+    ).toBe(true);
+  });
+
   it("respects abort signals while retrying one-shot main-session wake-now heartbeat runs", async () => {
     const abortController = new AbortController();
     const runHeartbeatOnce = vi.fn(
