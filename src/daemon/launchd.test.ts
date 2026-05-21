@@ -1,6 +1,7 @@
 import { PassThrough } from "node:stream";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  LAUNCH_AGENT_EXIT_TIMEOUT_SECONDS,
   LAUNCH_AGENT_THROTTLE_INTERVAL_SECONDS,
   LAUNCH_AGENT_UMASK_DECIMAL,
 } from "./launchd-plist.js";
@@ -544,6 +545,8 @@ describe("launchd install", () => {
     expect(plist).toContain(`<integer>${LAUNCH_AGENT_UMASK_DECIMAL}</integer>`);
     expect(plist).toContain("<key>ThrottleInterval</key>");
     expect(plist).toContain(`<integer>${LAUNCH_AGENT_THROTTLE_INTERVAL_SECONDS}</integer>`);
+    expect(plist).toContain("<key>ExitTimeOut</key>");
+    expect(plist).toContain(`<integer>${LAUNCH_AGENT_EXIT_TIMEOUT_SECONDS}</integer>`);
   });
 
   it("rewrites the plist before bootstrap during restart fallback", async () => {
@@ -766,6 +769,24 @@ describe("launchd install", () => {
       ...createDefaultLaunchdEnv(),
       OPENCLAW_GATEWAY_PORT: "18789",
     };
+    const plistPath = resolveLaunchAgentPlistPath(env);
+    state.files.set(
+      plistPath,
+      [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        '<plist version="1.0">',
+        "  <dict>",
+        "    <key>Label</key>",
+        "    <string>ai.openclaw.gateway</string>",
+        "    <key>ProgramArguments</key>",
+        "    <array>",
+        "      <string>node</string>",
+        "      <string>gateway.js</string>",
+        "    </array>",
+        "  </dict>",
+        "</plist>",
+      ].join("\n"),
+    );
     const result = await restartLaunchAgent({
       env,
       stdout: new PassThrough(),
@@ -780,6 +801,13 @@ describe("launchd install", () => {
     expect(state.launchctlCalls).toContainEqual(["kickstart", "-k", serviceId]);
     expect(state.launchctlCalls.some((call) => call[0] === "bootout")).toBe(false);
     expect(state.launchctlCalls.some((call) => call[0] === "bootstrap")).toBe(false);
+    const rewrittenPlist = state.files.get(plistPath) ?? "";
+    expect(rewrittenPlist).toContain("<key>ExitTimeOut</key>");
+    const rewriteIndex = state.fileWrites.findIndex((write) => write.path === plistPath);
+    const kickstartIndex = state.launchctlCalls.findIndex((call) => call[0] === "kickstart");
+    expect(rewriteIndex).toBeGreaterThanOrEqual(0);
+    expect(kickstartIndex).toBeGreaterThanOrEqual(0);
+    expect(rewriteIndex).toBeLessThan(kickstartIndex);
   });
 
   it("uses the configured gateway port for stale cleanup", async () => {

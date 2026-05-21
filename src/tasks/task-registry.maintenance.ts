@@ -38,6 +38,7 @@ const TASK_RECONCILE_GRACE_MS = 5 * 60_000;
 const TASK_RETENTION_MS = 7 * 24 * 60 * 60_000;
 const TASK_SWEEP_INTERVAL_MS = 60_000;
 const CRON_RUN_TIMESTAMP_DRIFT_MS = 1_000;
+const TASK_REGISTRY_DRAIN_POLL_MS = 250;
 
 /**
  * Number of tasks to process before yielding to the event loop.
@@ -586,6 +587,32 @@ configureTaskAuditTaskProvider(reconcileInspectableTasks);
 
 export function getInspectableTaskRegistrySummary(): TaskRegistrySummary {
   return summarizeTaskRecords(reconcileInspectableTasks());
+}
+
+export async function waitForInspectableTaskRegistryRunningIdle(
+  timeoutMs?: number,
+  opts?: { pollMs?: number },
+): Promise<{ drained: boolean; running: number }> {
+  const pollMsRaw = opts?.pollMs ?? TASK_REGISTRY_DRAIN_POLL_MS;
+  const pollMs = Math.max(10, Math.floor(pollMsRaw));
+  const maxWaitMs =
+    typeof timeoutMs === "number" && Number.isFinite(timeoutMs)
+      ? Math.max(0, Math.floor(timeoutMs))
+      : undefined;
+  const startedAt = Date.now();
+
+  for (;;) {
+    const running = getInspectableTaskRegistrySummary().byStatus.running;
+    if (running <= 0) {
+      return { drained: true, running: 0 };
+    }
+    if (maxWaitMs !== undefined && Date.now() - startedAt >= maxWaitMs) {
+      return { drained: false, running };
+    }
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, pollMs);
+    });
+  }
 }
 
 export function getInspectableTaskAuditSummary(): TaskAuditSummary {

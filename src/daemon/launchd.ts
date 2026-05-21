@@ -825,6 +825,11 @@ export async function restartLaunchAgent({
   // `openclaw gateway restart` is an explicit operator request to bring the
   // LaunchAgent back, so clear any persisted disabled state before restart.
   await execLaunchctl(["enable", serviceTarget]);
+  // Best-effort plist refresh keeps active services on current launchd policy
+  // such as ExitTimeOut without requiring a separate reinstall.
+  await rewriteLaunchAgentPlistForRestart({ env: serviceEnv, label, plistPath }).catch(
+    () => undefined,
+  );
 
   const start = await execLaunchctl(["kickstart", "-k", serviceTarget]);
   if (start.code === 0) {

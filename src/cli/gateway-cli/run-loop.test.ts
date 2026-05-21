@@ -30,6 +30,31 @@ const waitForBundledRuntimeDepsInstallIdle = vi.fn(async (_timeoutMs?: number) =
   drained: true,
   active: 0,
 }));
+const getInspectableTaskRegistrySummary = vi.fn(() => ({
+  total: 0,
+  active: 0,
+  terminal: 0,
+  failures: 0,
+  byStatus: {
+    queued: 0,
+    running: 0,
+    succeeded: 0,
+    failed: 0,
+    timed_out: 0,
+    cancelled: 0,
+    lost: 0,
+  },
+  byRuntime: {
+    subagent: 0,
+    acp: 0,
+    cli: 0,
+    cron: 0,
+  },
+}));
+const waitForInspectableTaskRegistryRunningIdle = vi.fn(async (_timeoutMs?: number) => ({
+  drained: true,
+  running: 0,
+}));
 const restartGatewayProcessWithFreshPid = vi.fn<
   () => { mode: "spawned" | "supervised" | "disabled" | "failed"; pid?: number; detail?: string }
 >(() => ({ mode: "disabled" }));
@@ -98,6 +123,12 @@ vi.mock("../../tasks/runtime-internal.js", () => ({
   reloadTaskRegistryFromStore: () => reloadTaskRegistryFromStore(),
 }));
 
+vi.mock("../../tasks/task-registry.maintenance.js", () => ({
+  getInspectableTaskRegistrySummary: () => getInspectableTaskRegistrySummary(),
+  waitForInspectableTaskRegistryRunningIdle: (timeoutMs?: number) =>
+    waitForInspectableTaskRegistryRunningIdle(timeoutMs),
+}));
+
 vi.mock("../../plugins/bundled-runtime-deps-activity.js", () => ({
   getActiveBundledRuntimeDepsInstallCount: () => getActiveBundledRuntimeDepsInstallCount(),
   waitForBundledRuntimeDepsInstallIdle: (timeoutMs?: number) =>
@@ -120,7 +151,7 @@ vi.mock("../../logging/subsystem.js", () => ({
   createSubsystemLogger: () => gatewayLog,
 }));
 
-const LOOP_SIGNALS = ["SIGTERM", "SIGINT", "SIGUSR1"] as const;
+const LOOP_SIGNALS = ["SIGTERM", "SIGINT", "SIGUSR1", "SIGHUP"] as const;
 type LoopSignal = (typeof LOOP_SIGNALS)[number];
 const originalPlatformDescriptor = Object.getOwnPropertyDescriptor(process, "platform");
 
@@ -319,6 +350,60 @@ describe("runGatewayLoop", () => {
         reason: "gateway stopping",
         restartExpectedMs: null,
       });
+    });
+  });
+
+  it("waits for running task-registry workers before LaunchAgent SIGTERM restart close", async () => {
+    vi.clearAllMocks();
+    consumeGatewayRestartIntentSync.mockReturnValueOnce(true);
+    getInspectableTaskRegistrySummary.mockReturnValueOnce({
+      total: 1,
+      active: 1,
+      terminal: 0,
+      failures: 0,
+      byStatus: {
+        queued: 0,
+        running: 1,
+        succeeded: 0,
+        failed: 0,
+        timed_out: 0,
+        cancelled: 0,
+        lost: 0,
+      },
+      byRuntime: {
+        subagent: 1,
+        acp: 0,
+        cli: 0,
+        cron: 0,
+      },
+    });
+    let releaseTaskRegistry!: () => void;
+    waitForInspectableTaskRegistryRunningIdle.mockReturnValueOnce(
+      new Promise((resolve) => {
+        releaseTaskRegistry = () => resolve({ drained: true, running: 0 });
+      }),
+    );
+
+    await withIsolatedSignals(async ({ captureSignal }) => {
+      const { close, start } = await createSignaledLoopHarness();
+      const sigterm = captureSignal("SIGTERM");
+
+      sigterm();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+
+      expect(markGatewayDraining).toHaveBeenCalledOnce();
+      expect(waitForInspectableTaskRegistryRunningIdle).toHaveBeenCalledWith(90_000);
+      expect(close).not.toHaveBeenCalled();
+
+      releaseTaskRegistry();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      await new Promise<void>((resolve) => setImmediate(resolve));
+
+      expect(close).toHaveBeenCalledWith({
+        reason: "gateway restarting",
+        restartExpectedMs: 1500,
+      });
+      expect(start).toHaveBeenCalledTimes(2);
     });
   });
 

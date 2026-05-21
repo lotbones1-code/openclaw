@@ -151,6 +151,7 @@ function configureTaskRegistryMaintenanceRuntimeForTest(params: {
     loadCronStoreSync: () => ({ version: 1, jobs: [] }),
     resolveCronRunLogPath: ({ jobId }) => jobId,
     readCronRunLogEntriesSync: () => [],
+    listTaskControlRecords: () => [],
   });
 }
 
@@ -1665,6 +1666,7 @@ describe("task-registry", () => {
         loadCronStoreSync: () => ({ version: 1, jobs: [] }),
         resolveCronRunLogPath: ({ jobId }) => jobId,
         readCronRunLogEntriesSync: () => [],
+        listTaskControlRecords: () => [],
       });
 
       try {
@@ -1967,6 +1969,9 @@ describe("task-registry", () => {
         warnings: 0,
         errors: 1,
         byCode: {
+          REPORTING_DEFECT: 0,
+          STALE_TASK_WRAPPER: 0,
+          TASK_REGISTRY_MISMATCH: 0,
           stale_queued: 0,
           stale_running: 1,
           lost: 0,
