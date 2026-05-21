@@ -1,5 +1,5 @@
 import fs from "node:fs/promises";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   createAbortAwareIsolatedRunner,
   createDefaultIsolatedRunner,
@@ -17,6 +17,7 @@ import {
   createRunningTaskRun,
   failTaskRunByRunId,
 } from "../../tasks/detached-task-runtime.js";
+import { configureTaskFlowRegistryRuntime } from "../../tasks/task-flow-registry.store.js";
 import {
   createManagedTaskFlow,
   listTaskFlowRecords,
@@ -46,6 +47,18 @@ const timerRegressionFixtures = setupCronRegressionFixtures({
 afterEach(() => {
   resetTaskRegistryForTests({ persist: false });
   resetTaskFlowRegistryForTests({ persist: false });
+});
+
+beforeEach(() => {
+  configureTaskFlowRegistryRuntime({
+    store: {
+      loadSnapshot: () => ({ flows: new Map() }),
+      saveSnapshot: () => {},
+      upsertFlow: () => {},
+      deleteFlow: () => {},
+      close: () => {},
+    },
+  });
 });
 
 function createCronTaskLedger(params: {
@@ -204,6 +217,133 @@ describe("cron service timer regressions", () => {
     expect(state.store?.jobs.find((job) => job.id === "content-factory")?.state.nextRunAtMs).toBe(
       nowMs + 60_000,
     );
+  });
+
+  it("mission runtime V2 dispatches parallel mission units and spawns novel agent work natively", async () => {
+    vi.useRealTimers();
+    const store = timerRegressionFixtures.makeStorePath();
+    const nowMs = Date.parse("2026-05-21T12:10:00.000Z");
+    const target = {
+      ...createDueIsolatedJob({
+        id: "v2-target-enrichment",
+        nowMs,
+        nextRunAtMs: nowMs + 10 * 60_000,
+      }),
+      name: "Target Enrichment + CRO",
+      payload: { kind: "agentTurn", message: "Find buyer targets and CRO proof" },
+    } as CronJob;
+    const content = {
+      ...createDueIsolatedJob({
+        id: "v2-content-factory",
+        nowMs,
+        nextRunAtMs: nowMs + 10 * 60_000,
+      }),
+      name: "Content Factory",
+      payload: { kind: "agentTurn", message: "Create content packet" },
+    } as CronJob;
+    await writeCronJobs(store.storePath, [target, content]);
+
+    let activeRuns = 0;
+    let peakActiveRuns = 0;
+    const bothRunsStarted = createDeferred<void>();
+    const targetRun = createDeferred<{ status: "ok"; summary: string }>();
+    const contentRun = createDeferred<{ status: "ok"; summary: string }>();
+    const agentRun = createDeferred<{ status: "ok"; summary: string }>();
+    const runIsolatedAgentJob = vi.fn(async (params: { job: CronJob }) => {
+      activeRuns += 1;
+      peakActiveRuns = Math.max(peakActiveRuns, activeRuns);
+      if (peakActiveRuns >= 3) {
+        bothRunsStarted.resolve();
+      }
+      try {
+        if (params.job.id === target.id) {
+          return await targetRun.promise;
+        }
+        if (params.job.id === content.id) {
+          return await contentRun.promise;
+        }
+        return await agentRun.promise;
+      } finally {
+        activeRuns -= 1;
+      }
+    });
+
+    createManagedTaskFlow({
+      controllerId: "mission-runtime",
+      ownerKey: "mission-runtime:v2:novel-mission",
+      notifyPolicy: "silent",
+      status: "running",
+      goal: "Source a novel wholesale channel and decide next best company action",
+      currentStep: "mission_active",
+      stateJson: {
+        openclawMission: buildOpenClawMissionContract({
+          missionId: "v2-novel-business-mission",
+          userRequest: "Source a novel wholesale channel and decide next best company action",
+          selectedOption: "novel_wholesale_channel",
+          objective: "Source a novel wholesale channel and decide next best company action",
+          nowMs,
+          wakeTime: new Date(nowMs + 60 * 60_000).toISOString(),
+          proofPath: "/tmp/v2-novel-business-mission.md",
+        }),
+      },
+      createdAt: nowMs - 10_000,
+      updatedAt: nowMs - 10_000,
+    });
+
+    const state = createCronServiceState({
+      cronEnabled: true,
+      storePath: store.storePath,
+      cronConfig: { maxConcurrentRuns: 3 },
+      log: noopLogger,
+      nowMs: () => nowMs,
+      executionKernel: {
+        missionRuntime: {
+          enabled: true,
+          mode: "active",
+          standingCompanyDirective: true,
+          suppressLaneAutonomy: true,
+          maxParallelDispatch: 3,
+          novelAgentEnabled: true,
+        },
+      },
+      enqueueSystemEvent: vi.fn(),
+      requestHeartbeatNow: vi.fn(),
+      runIsolatedAgentJob,
+    });
+
+    const timerPromise = onTimer(state);
+    const startTimeout = setTimeout(() => {
+      bothRunsStarted.reject(new Error("timed out waiting for parallel mission units"));
+    }, 500);
+    try {
+      await bothRunsStarted.promise;
+    } finally {
+      clearTimeout(startTimeout);
+    }
+
+    expect(peakActiveRuns).toBe(3);
+    targetRun.resolve({ status: "ok", summary: "target done" });
+    contentRun.resolve({ status: "ok", summary: "content done" });
+    agentRun.resolve({ status: "ok", summary: "novel agent done" });
+    await timerPromise;
+
+    const calledJobs = runIsolatedAgentJob.mock.calls.map(([params]) => params.job);
+    expect(calledJobs.map((job) => job.id)).toEqual(
+      expect.arrayContaining(["v2-target-enrichment", "v2-content-factory"]),
+    );
+    const spawned = calledJobs.find((job) => job.id.startsWith("mission-agent-"));
+    expect(spawned?.sessionTarget).toBe("isolated");
+    expect(spawned?.payload.kind).toBe("agentTurn");
+    if (spawned?.payload.kind === "agentTurn") {
+      expect(spawned.payload.model).toBe("claude-cli/claude-opus-4-7");
+      expect(spawned.payload.message).toContain("available MCP tools");
+      expect(spawned.payload.message).toContain("available OpenClaw skills");
+    }
+    expect(
+      listTaskFlowRecords().some((record) =>
+        record.ownerKey.includes("mission-runtime:agent-spawn:"),
+      ),
+    ).toBe(true);
   });
 
   it("re-arms timer without hot-looping when a run is already in progress", async () => {

@@ -1,10 +1,11 @@
 import { describe, expect, it } from "vitest";
 import type { CronJob } from "../cron/types.js";
 import {
+  buildOpenClawMissionContract,
   buildWorkManagerSnapshot,
   type WorkManagerCandidate,
 } from "../work-manager/work-manager.js";
-import { selectMissionRuntimeUnit } from "./mission-runtime.js";
+import { selectMissionRuntimeDispatchPlan, selectMissionRuntimeUnit } from "./mission-runtime.js";
 
 const now = Date.parse("2026-05-21T12:00:00.000Z");
 
@@ -156,4 +157,159 @@ describe("mission runtime", () => {
       reason: "p0_p1_company_work_already_active",
     });
   });
+
+  it("plans multiple bounded units when parallel dispatch capacity is available", () => {
+    const target = cronJob({ id: "target", name: "Target Enrichment + CRO" });
+    const content = cronJob({ id: "content", name: "Content Factory" });
+    const social = cronJob({ id: "social", name: "Titan Brand Comment Lane" });
+    const snapshot = buildWorkManagerSnapshot({
+      nowMs: now,
+      mode: "admission",
+      taskFlows: [],
+      tasks: [],
+      cronJobs: [target, content, social],
+    });
+
+    const plan = selectMissionRuntimeDispatchPlan({
+      nowMs: now,
+      snapshot,
+      cronJobs: [target, content, social],
+      queuedCandidates: [],
+      standingCompanyDirective: true,
+      maxParallelDispatch: 3,
+    });
+
+    expect(plan.decision).toBe("dispatch");
+    expect(plan.units.map((unit) => unit.action)).toEqual([
+      "promote_cron",
+      "promote_cron",
+      "promote_cron",
+    ]);
+    expect(plan.units.map((unit) => unit.unitKind)).toEqual([
+      "known_capability",
+      "known_capability",
+      "known_capability",
+    ]);
+    expect(plan.suppressedCronJobIds).toEqual([]);
+  });
+
+  it("creates a novel agent packet when no coded capability fits the mission", () => {
+    const snapshot = buildWorkManagerSnapshot({
+      nowMs: now,
+      mode: "admission",
+      taskFlows: [
+        missionFlow({
+          objective: "Find and evaluate a new supplier portal Shamil mentioned in Telegram",
+          selectedOption: "new_supplier_portal",
+        }),
+      ],
+      tasks: [],
+      cronJobs: [],
+    });
+
+    const plan = selectMissionRuntimeDispatchPlan({
+      nowMs: now,
+      snapshot,
+      cronJobs: [],
+      queuedCandidates: [],
+      maxParallelDispatch: 2,
+    });
+
+    expect(plan.decision).toBe("dispatch");
+    expect(plan.units).toHaveLength(1);
+    expect(plan.units[0]).toMatchObject({
+      action: "spawn_agent",
+      unitKind: "novel_agent",
+      pool: "research",
+      priority: "P1",
+    });
+    expect(plan.units[0]?.agentPacket?.prompt).toContain("available MCP tools");
+    expect(plan.units[0]?.agentPacket?.prompt).toContain("available OpenClaw skills");
+  });
+
+  it("creates a self-builder packet for repeated capability gaps", () => {
+    const redSocial = cronJob({
+      id: "social-red",
+      name: "Titan Brand Comment Lane",
+      state: { nextRunAtMs: now, consecutiveErrors: 4, lastRunStatus: "error" },
+    });
+    const snapshot = buildWorkManagerSnapshot({
+      nowMs: now,
+      mode: "admission",
+      taskFlows: [],
+      tasks: [],
+      cronJobs: [redSocial],
+    });
+
+    const plan = selectMissionRuntimeDispatchPlan({
+      nowMs: now,
+      snapshot,
+      cronJobs: [redSocial],
+      queuedCandidates: [],
+      standingCompanyDirective: true,
+      maxParallelDispatch: 2,
+    });
+
+    expect(plan.units.some((unit) => unit.unitKind === "self_improvement")).toBe(true);
+    const selfBuild = plan.units.find((unit) => unit.unitKind === "self_improvement");
+    expect(selfBuild?.agentPacket?.prompt).toContain("Self-Builder Contract");
+    expect(selfBuild?.agentPacket?.prompt).toContain("CAPABILITY_DEGRADED:social-red");
+  });
+
+  it("routes personal directives into personal-assistant agent packets", () => {
+    const snapshot = buildWorkManagerSnapshot({
+      nowMs: now,
+      mode: "admission",
+      taskFlows: [
+        missionFlow({
+          objective: "Help Shamil organize personal files and schedule reminders",
+          selectedOption: "personal_assistant",
+        }),
+      ],
+      tasks: [],
+      cronJobs: [],
+    });
+
+    const plan = selectMissionRuntimeDispatchPlan({
+      nowMs: now,
+      snapshot,
+      cronJobs: [],
+      queuedCandidates: [],
+      maxParallelDispatch: 2,
+    });
+
+    expect(plan.units[0]).toMatchObject({
+      action: "spawn_agent",
+      unitKind: "personal_assistant",
+      pool: "personal",
+      priority: "P0_USER_DIRECTIVE",
+    });
+    expect(plan.units[0]?.agentPacket?.prompt).toContain("personal assistant");
+  });
 });
+
+function missionFlow(params: { objective: string; selectedOption: string }) {
+  const mission = buildOpenClawMissionContract({
+    missionId: `mission-${params.selectedOption}`,
+    userRequest: params.objective,
+    selectedOption: params.selectedOption,
+    objective: params.objective,
+    nowMs: now,
+    wakeTime: new Date(now + 60 * 60_000).toISOString(),
+    proofPath: `/tmp/${params.selectedOption}.md`,
+  });
+  return {
+    flowId: `flow-${params.selectedOption}`,
+    syncMode: "managed" as const,
+    ownerKey: `mission:${params.selectedOption}`,
+    controllerId: "mission-runtime",
+    revision: 0,
+    status: "running" as const,
+    notifyPolicy: "silent" as const,
+    goal: params.objective,
+    currentStep: "active",
+    stateJson: { openclawMission: mission },
+    createdAt: now - 10_000,
+    updatedAt: now - 1_000,
+  };
+}

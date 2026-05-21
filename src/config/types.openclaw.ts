@@ -158,6 +158,11 @@ export type OpenClawConfig = {
       mode?: "shadow" | "active";
       standingCompanyDirective?: boolean;
       suppressLaneAutonomy?: boolean;
+      maxParallelDispatch?: number;
+      novelAgentEnabled?: boolean;
+      selfImprovementEnabled?: boolean;
+      personalAssistantEnabled?: boolean;
+      agentModel?: string;
     };
   };
   /** Network-level SSRF protection via an operator-managed forward proxy. */

@@ -3,8 +3,12 @@ import type { CronConfig, CronRetryOn } from "../../config/types.cron.js";
 import type { HeartbeatRunResult } from "../../infra/heartbeat-wake.js";
 import {
   isMissionRuntimeAutonomousCronJob,
-  selectMissionRuntimeUnit,
+  selectMissionRuntimeDispatchPlan,
 } from "../../mission-runtime/mission-runtime.js";
+import type {
+  MissionRuntimeDispatchPlan,
+  MissionRuntimeDispatchUnit,
+} from "../../mission-runtime/mission-runtime.types.js";
 import {
   getLatestReliabilityHealthSnapshot,
   recordReliabilityEvent,
@@ -166,7 +170,11 @@ export async function executeJobCoreWithTimeout(
 }
 
 function resolveRunConcurrency(state: CronServiceState): number {
-  const raw = state.deps.cronConfig?.maxConcurrentRuns;
+  const raw =
+    state.deps.cronConfig?.maxConcurrentRuns ??
+    (state.deps.executionKernel?.missionRuntime?.enabled === true
+      ? state.deps.executionKernel.missionRuntime.maxParallelDispatch
+      : undefined);
   if (typeof raw !== "number" || !Number.isFinite(raw)) {
     return 1;
   }
@@ -1375,6 +1383,7 @@ function applyMissionRuntimeTick(
     state.deps.executionKernel.missionRuntime.standingCompanyDirective !== false;
   const suppressLaneAutonomy =
     state.deps.executionKernel.missionRuntime.suppressLaneAutonomy !== false;
+  const maxParallelDispatch = state.deps.executionKernel.missionRuntime.maxParallelDispatch;
   const snapshot = buildWorkManagerSnapshot({
     nowMs,
     mode: "admission",
@@ -1386,19 +1395,24 @@ function applyMissionRuntimeTick(
   });
   const queuedCandidates =
     snapshot.queueDrain.decision === "dispatch" ? [snapshot.queueDrain.candidate] : [];
-  const decision = selectMissionRuntimeUnit({
+  const plan = selectMissionRuntimeDispatchPlan({
     nowMs,
     snapshot,
     cronJobs: state.store.jobs,
     queuedCandidates,
     standingCompanyDirective,
+    maxParallelDispatch,
+    novelAgentEnabled: state.deps.executionKernel.missionRuntime.novelAgentEnabled,
+    selfImprovementEnabled: state.deps.executionKernel.missionRuntime.selfImprovementEnabled,
+    personalAssistantEnabled: state.deps.executionKernel.missionRuntime.personalAssistantEnabled,
+    agentModel: state.deps.executionKernel.missionRuntime.agentModel,
   });
 
   const skipJobIds =
     mode === "active" && suppressLaneAutonomy
-      ? new Set(decision.suppressedCronJobIds)
+      ? new Set(plan.suppressedCronJobIds)
       : new Set<string>();
-  let changed = upsertMissionRuntimeDecisionFlow({ decision, nowMs, mode });
+  let changed = upsertMissionRuntimeDecisionFlow({ plan, nowMs, mode });
   if (mode !== "active") {
     return { enabled: true, changed, skipJobIds: new Set<string>() };
   }
@@ -1409,49 +1423,27 @@ function applyMissionRuntimeTick(
         state,
         nowMs,
         skipJobIds,
-        selectedJobId: decision.decision === "promote_cron" ? decision.cronJobId : undefined,
+        selectedJobIds: new Set(
+          plan.decision === "dispatch"
+            ? plan.units
+                .filter((unit) => unit.action === "promote_cron")
+                .map((unit) => unit.cronJobId)
+            : [],
+        ),
       }) || changed;
   }
 
-  if (decision.decision === "promote_cron") {
-    const job = state.store.jobs.find((entry) => entry.id === decision.cronJobId);
-    if (job && isJobEnabled(job) && typeof job.state.runningAtMs !== "number") {
-      job.state.nextRunAtMs = nowMs;
-      job.updatedAtMs = nowMs;
-      changed = true;
-      upsertMissionRuntimeDispatchFlow({
-        job,
-        candidate: decision.candidate,
-        missionId: decision.mission?.mission_id ?? "standing_company_directive",
-        nowMs,
-      });
-      state.deps.log.info(
-        { jobId: job.id, missionId: decision.mission?.mission_id },
-        "cron: mission runtime promoted selected native capability",
-      );
-      recordReliabilityEvent({
-        subsystem: "cron",
-        code: "mission_runtime_cron_promoted",
-        severity: "info",
-        subject: job.id,
-        message: `cron: mission runtime promoted ${job.name}`,
-        recoverable: true,
-        quiet: true,
-        createdAt: nowMs,
-        metadata: {
-          jobId: job.id,
-          missionId: decision.mission?.mission_id,
-          suppressedCronJobIds: decision.suppressedCronJobIds,
-        },
-      });
+  if (plan.decision === "dispatch") {
+    for (const unit of plan.units) {
+      changed =
+        applyMissionRuntimeDispatchUnit({
+          state,
+          unit,
+          missionId: plan.mission.mission_id,
+          nowMs,
+          suppressedCronJobIds: plan.suppressedCronJobIds,
+        }) || changed;
     }
-  } else if (decision.decision === "start_taskflow") {
-    changed =
-      startMissionRuntimeTaskFlow({
-        candidate: decision.candidate,
-        missionId: decision.mission?.mission_id ?? "standing_company_directive",
-        nowMs,
-      }) || changed;
   }
 
   return { enabled: true, changed, skipJobIds };
@@ -1461,14 +1453,14 @@ function suppressAutonomousLaneCronJobs(params: {
   state: CronServiceState;
   nowMs: number;
   skipJobIds: ReadonlySet<string>;
-  selectedJobId?: string;
+  selectedJobIds?: ReadonlySet<string>;
 }): boolean {
   if (!params.state.store || params.skipJobIds.size === 0) {
     return false;
   }
   let changed = false;
   for (const job of params.state.store.jobs) {
-    if (!params.skipJobIds.has(job.id) || job.id === params.selectedJobId) {
+    if (!params.skipJobIds.has(job.id) || params.selectedJobIds?.has(job.id)) {
       continue;
     }
     if (!isMissionRuntimeAutonomousCronJob(job)) {
@@ -1885,7 +1877,7 @@ function upsertMissionRevenueFloorWorkFlow(params: {
 }
 
 function upsertMissionRuntimeDecisionFlow(params: {
-  decision: ReturnType<typeof selectMissionRuntimeUnit>;
+  plan: MissionRuntimeDispatchPlan;
   nowMs: number;
   mode: "shadow" | "active";
 }): boolean {
@@ -1893,24 +1885,36 @@ function upsertMissionRuntimeDecisionFlow(params: {
   const runtimeState: Record<string, JsonValue> = {
     version: 1,
     mode: params.mode,
-    decision: params.decision.decision,
-    reason: params.decision.reason,
-    suppressedCronJobIds: params.decision.suppressedCronJobIds,
-    exactGates: params.decision.exactGates,
-    nextCheckAt: params.decision.nextCheckAt,
+    decision: params.plan.decision,
+    reason: params.plan.reason,
+    suppressedCronJobIds: params.plan.suppressedCronJobIds,
+    exactGates: params.plan.exactGates,
+    nextCheckAt: params.plan.nextCheckAt,
+    parallelLimit: params.plan.parallelLimit,
     decidedAt: params.nowMs,
   };
-  if (params.decision.decision === "promote_cron") {
-    runtimeState.selectedCronJobId = params.decision.cronJobId;
-  }
-  if (params.decision.decision === "start_taskflow") {
-    runtimeState.selectedWorkId = params.decision.workId;
+  if (params.plan.decision === "dispatch") {
+    runtimeState.units = params.plan.units.map((unit) => ({
+      action: unit.action,
+      unitKind: unit.unitKind,
+      workId:
+        unit.action === "promote_cron"
+          ? unit.candidate.workId
+          : unit.action === "start_taskflow"
+            ? unit.workId
+            : unit.workId,
+      ...(unit.action === "promote_cron" ? { cronJobId: unit.cronJobId } : {}),
+      proofPath: unit.proofPath,
+      expectedOutput: unit.expectedOutput,
+      pool: unit.pool,
+      priority: unit.priority,
+    })) as JsonValue;
   }
   const stateJson: Record<string, JsonValue> = {
     openclawMissionRuntime: runtimeState,
   };
-  if (params.decision.mission) {
-    stateJson.openclawMission = params.decision.mission as unknown as JsonValue;
+  if (params.plan.mission) {
+    stateJson.openclawMission = params.plan.mission as unknown as JsonValue;
   }
   const existing = findLatestTaskFlowForOwnerKey(ownerKey);
   if (existing && ["queued", "running", "waiting", "blocked"].includes(existing.status)) {
@@ -1940,6 +1944,63 @@ function upsertMissionRuntimeDecisionFlow(params: {
     endedAt: null,
   });
   return true;
+}
+
+function applyMissionRuntimeDispatchUnit(params: {
+  state: CronServiceState;
+  unit: MissionRuntimeDispatchUnit;
+  missionId: string;
+  nowMs: number;
+  suppressedCronJobIds: string[];
+}): boolean {
+  const unit = params.unit;
+  if (unit.action === "promote_cron") {
+    const job = params.state.store?.jobs.find((entry) => entry.id === unit.cronJobId);
+    if (!job || !isJobEnabled(job) || typeof job.state.runningAtMs === "number") {
+      return false;
+    }
+    job.state.nextRunAtMs = params.nowMs;
+    job.updatedAtMs = params.nowMs;
+    upsertMissionRuntimeDispatchFlow({
+      job,
+      candidate: unit.candidate,
+      missionId: params.missionId,
+      nowMs: params.nowMs,
+    });
+    params.state.deps.log.info(
+      { jobId: job.id, missionId: params.missionId },
+      "cron: mission runtime promoted selected native capability",
+    );
+    recordReliabilityEvent({
+      subsystem: "cron",
+      code: "mission_runtime_cron_promoted",
+      severity: "info",
+      subject: job.id,
+      message: `cron: mission runtime promoted ${job.name}`,
+      recoverable: true,
+      quiet: true,
+      createdAt: params.nowMs,
+      metadata: {
+        jobId: job.id,
+        missionId: params.missionId,
+        suppressedCronJobIds: params.suppressedCronJobIds,
+      },
+    });
+    return true;
+  }
+  if (unit.action === "start_taskflow") {
+    return startMissionRuntimeTaskFlow({
+      candidate: unit.candidate,
+      missionId: params.missionId,
+      nowMs: params.nowMs,
+    });
+  }
+  return upsertMissionRuntimeAgentCronJob({
+    state: params.state,
+    unit,
+    missionId: params.missionId,
+    nowMs: params.nowMs,
+  });
 }
 
 function upsertMissionRuntimeDispatchFlow(params: {
@@ -2015,6 +2076,176 @@ function upsertMissionRuntimeDispatchFlow(params: {
     updatedAt: params.nowMs,
     endedAt: params.nowMs,
   });
+}
+
+function upsertMissionRuntimeAgentCronJob(params: {
+  state: CronServiceState;
+  unit: Extract<MissionRuntimeDispatchUnit, { action: "spawn_agent" }>;
+  missionId: string;
+  nowMs: number;
+}): boolean {
+  if (!params.state.store) {
+    return false;
+  }
+  const jobId = missionAgentCronJobId(params.unit.workId);
+  const existing = params.state.store.jobs.find((job) => job.id === jobId);
+  if (existing && typeof existing.state.runningAtMs === "number") {
+    return false;
+  }
+  const job: CronJob =
+    existing ??
+    ({
+      id: jobId,
+      agentId: params.state.deps.defaultAgentId ?? DEFAULT_AGENT_ID,
+      name: `Mission Agent — ${params.unit.unitKind.replaceAll("_", " ")}`,
+      description: `Mission Runtime spawned native agent work for ${params.missionId}`,
+      enabled: true,
+      deleteAfterRun: false,
+      createdAtMs: params.nowMs,
+      updatedAtMs: params.nowMs,
+      schedule: { kind: "at", at: new Date(params.nowMs).toISOString() },
+      sessionTarget: "isolated",
+      wakeMode: "now",
+      payload: {
+        kind: "agentTurn",
+        message: params.unit.agentPacket.prompt,
+        model: params.unit.agentPacket.model,
+        timeoutSeconds: Math.ceil(params.unit.agentPacket.timeoutMs / 1000),
+      },
+      delivery: { mode: "none" },
+      state: {},
+    } satisfies CronJob);
+  job.enabled = true;
+  job.updatedAtMs = params.nowMs;
+  job.schedule = { kind: "at", at: new Date(params.nowMs).toISOString() };
+  job.sessionTarget = "isolated";
+  job.wakeMode = "now";
+  job.payload = {
+    kind: "agentTurn",
+    message: params.unit.agentPacket.prompt,
+    model: params.unit.agentPacket.model,
+    timeoutSeconds: Math.ceil(params.unit.agentPacket.timeoutMs / 1000),
+  };
+  job.delivery = { mode: "none" };
+  job.state.nextRunAtMs = params.nowMs;
+  job.state.lastError = undefined;
+  if (!existing) {
+    params.state.store.jobs.push(job);
+  }
+  upsertMissionRuntimeAgentDispatchFlow({
+    job,
+    unit: params.unit,
+    missionId: params.missionId,
+    nowMs: params.nowMs,
+  });
+  params.state.deps.log.info(
+    {
+      jobId,
+      missionId: params.missionId,
+      unitKind: params.unit.unitKind,
+      workId: params.unit.workId,
+    },
+    "cron: mission runtime spawned native agent work",
+  );
+  recordReliabilityEvent({
+    subsystem: "cron",
+    code: "mission_runtime_agent_spawned",
+    severity: "info",
+    subject: jobId,
+    message: `cron: mission runtime spawned ${params.unit.unitKind} agent`,
+    recoverable: true,
+    quiet: true,
+    createdAt: params.nowMs,
+    metadata: {
+      jobId,
+      missionId: params.missionId,
+      workId: params.unit.workId,
+      unitKind: params.unit.unitKind,
+    },
+  });
+  return true;
+}
+
+function upsertMissionRuntimeAgentDispatchFlow(params: {
+  job: CronJob;
+  unit: Extract<MissionRuntimeDispatchUnit, { action: "spawn_agent" }>;
+  missionId: string;
+  nowMs: number;
+}) {
+  const ownerKey = `mission-runtime:agent-spawn:${params.missionId}:${params.unit.workId}`;
+  const stateJson = {
+    openclawWorkManager: {
+      version: 1,
+      workId: params.unit.workId,
+      lane: `Mission Agent ${params.unit.unitKind}`,
+      pool: params.unit.pool,
+      priority: params.unit.priority,
+      requestedResources: params.unit.requestedResources,
+      expectedOutput: params.unit.expectedOutput,
+      proofPath: params.unit.proofPath,
+      timeoutMs: params.unit.agentPacket.timeoutMs,
+      owner: "mission-runtime",
+      workStatus: "queued",
+      createdAt: params.nowMs,
+      leaseUntil: params.nowMs + params.unit.agentPacket.timeoutMs,
+      handoffDepth: 0,
+    },
+    openclawMissionRuntime: {
+      version: 2,
+      missionId: params.missionId,
+      decision: "spawn_agent",
+      unitKind: params.unit.unitKind,
+      workId: params.unit.workId,
+      cronJobId: params.job.id,
+      proofPath: params.unit.proofPath,
+      expectedOutput: params.unit.expectedOutput,
+      agentModel: params.unit.agentPacket.model,
+      skillHints: params.unit.agentPacket.skillHints,
+      toolHints: params.unit.agentPacket.toolHints,
+      spawnedAt: params.nowMs,
+    },
+    openclawLastRecoveryAction: `mission_runtime:agent_spawned:${params.job.id}`,
+  } satisfies Record<string, JsonValue>;
+  const existing = findLatestTaskFlowForOwnerKey(ownerKey);
+  if (existing && ["queued", "running", "waiting", "blocked"].includes(existing.status)) {
+    updateFlowRecordByIdExpectedRevision({
+      flowId: existing.flowId,
+      expectedRevision: existing.revision,
+      patch: {
+        status: "queued",
+        currentStep: "mission_runtime_agent_spawned",
+        stateJson,
+        updatedAt: params.nowMs,
+        endedAt: null,
+      },
+    });
+    return;
+  }
+  createManagedTaskFlow({
+    controllerId: MISSION_RUNTIME_CONTROLLER_ID,
+    ownerKey,
+    notifyPolicy: "silent",
+    status: "queued",
+    goal: `Mission Runtime spawned ${params.unit.unitKind} agent`,
+    currentStep: "mission_runtime_agent_spawned",
+    stateJson,
+    createdAt: params.nowMs,
+    updatedAt: params.nowMs,
+    endedAt: null,
+  });
+}
+
+function missionAgentCronJobId(workId: string): string {
+  return `mission-agent-${stableShortHash(workId)}`;
+}
+
+function stableShortHash(value: string): string {
+  let hash = 2166136261;
+  for (let i = 0; i < value.length; i += 1) {
+    hash ^= value.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(36).padStart(7, "0").slice(0, 10);
 }
 
 function startMissionRuntimeTaskFlow(params: {

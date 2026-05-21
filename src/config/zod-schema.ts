@@ -996,6 +996,11 @@ export const OpenClawSchema = z
             mode: z.enum(["shadow", "active"]).optional(),
             standingCompanyDirective: z.boolean().optional(),
             suppressLaneAutonomy: z.boolean().optional(),
+            maxParallelDispatch: z.number().int().positive().max(12).optional(),
+            novelAgentEnabled: z.boolean().optional(),
+            selfImprovementEnabled: z.boolean().optional(),
+            personalAssistantEnabled: z.boolean().optional(),
+            agentModel: z.string().optional(),
           })
           .strict()
           .optional(),
