@@ -410,6 +410,50 @@ describe("work manager", () => {
     );
   });
 
+  it("does not report directives from terminal TaskFlows as active", () => {
+    const directive = buildOpenClawDirectiveContract({
+      directiveId: "directive-higgsfield-starter",
+      userRequest: "connect Higgsfield Starter",
+      selectedOption: "Starter monthly",
+      goal: "verify Higgsfield Starter workspace",
+      taskClass: "tool_integration",
+      vendor: "Higgsfield",
+      allowedActions: ["verify_cli_account"],
+      forbiddenActions: ["repeat_purchase"],
+      constraints: ["do not repeat purchase"],
+      budgetOrPriceCap: 20,
+      billingPeriod: "monthly",
+      exactPlanName: "Starter",
+      successCriteria: ["CLI connected"],
+      proofRequired: ["status proof"],
+      hardGates: ["WRONG_PLAN"],
+      fallbackPolicy: "stop at exact gate",
+      stopInstruction: "stop Higgsfield",
+      rollbackInstruction: "retire stale directive flow",
+      proofPath: "/tmp/higgsfield-directive.md",
+      createdFromMessage: "Shamil authorized Starter around $20 monthly",
+      nowIso: new Date(now).toISOString(),
+      ownerDirectApproval: true,
+    });
+    directive.current_state = "blocked";
+
+    const snapshot = buildWorkManagerSnapshot({
+      nowMs: now,
+      tasks: [],
+      taskFlows: [
+        flow({
+          status: "cancelled",
+          updatedAt: now,
+          stateJson: { openclawDirective: directive },
+        }),
+      ],
+      reliability: reliability("green"),
+      mode: "admission",
+    });
+
+    expect(snapshot.activeDirective).toBeUndefined();
+  });
+
   it("builds a valid revenue mission contract from a selected user objective", () => {
     const mission = buildOpenClawMissionContract({
       missionId: "mission-revenue-1",

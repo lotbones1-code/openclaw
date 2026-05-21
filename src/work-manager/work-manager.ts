@@ -855,15 +855,29 @@ function flowStatusToWorkStatus(status: TaskFlowRecord["status"]): ManagedWorkSt
   return status === "blocked" ? "blocked" : status;
 }
 
+function isTerminalTaskFlowStatus(status: TaskFlowRecord["status"]): boolean {
+  return (
+    status === "succeeded" || status === "failed" || status === "cancelled" || status === "lost"
+  );
+}
+
 function resolveActiveMission(flows: TaskFlowRecord[]): OpenClawMissionContract | undefined {
   return flows
     .map((flow) => ({
       mission: readMissionContract(flow.stateJson),
+      flowStatus: flow.status,
       updatedAt: flow.updatedAt,
     }))
     .filter(
-      (entry): entry is { mission: OpenClawMissionContract; updatedAt: number } =>
+      (
+        entry,
+      ): entry is {
+        mission: OpenClawMissionContract;
+        flowStatus: TaskFlowRecord["status"];
+        updatedAt: number;
+      } =>
         Boolean(entry.mission) &&
+        !isTerminalTaskFlowStatus(entry.flowStatus) &&
         (entry.mission?.status === "active" ||
           entry.mission?.status === "queued" ||
           entry.mission?.status === "blocked"),
@@ -882,17 +896,29 @@ function resolveActiveDirective(flows: TaskFlowRecord[]): OpenClawDirectiveContr
   return flows
     .map((flow) => ({
       directive: readDirectiveContract(flow.stateJson),
+      flowStatus: flow.status,
       updatedAt: flow.updatedAt,
     }))
-    .filter((entry): entry is { directive: OpenClawDirectiveContract; updatedAt: number } => {
-      const directive = entry.directive;
-      if (!directive) {
-        return false;
-      }
-      return !["completed", "succeeded", "failed", "cancelled", "stopped"].includes(
-        directive.current_state,
-      );
-    })
+    .filter(
+      (
+        entry,
+      ): entry is {
+        directive: OpenClawDirectiveContract;
+        flowStatus: TaskFlowRecord["status"];
+        updatedAt: number;
+      } => {
+        const directive = entry.directive;
+        if (!directive) {
+          return false;
+        }
+        if (isTerminalTaskFlowStatus(entry.flowStatus)) {
+          return false;
+        }
+        return !["completed", "succeeded", "failed", "cancelled", "stopped"].includes(
+          directive.current_state,
+        );
+      },
+    )
     .sort((a, b) => b.updatedAt - a.updatedAt)[0]?.directive;
 }
 
