@@ -46,6 +46,10 @@ function taskReferenceAt(task: TaskRecord): number {
   return task.lastEventAt ?? task.startedAt ?? task.createdAt;
 }
 
+function isTaskFlowRepairProxy(task: TaskRecord): boolean {
+  return task.taskKind === "taskflow_repair";
+}
+
 function findTimestampInconsistency(task: TaskRecord): TaskAuditFinding | null {
   if (task.startedAt && task.startedAt < task.createdAt) {
     return createFinding({
@@ -122,7 +126,7 @@ export function listTaskAuditFindings(options: TaskAuditOptions = {}): TaskAudit
     const referenceAt = taskReferenceAt(task);
     const ageMs = Math.max(0, now - referenceAt);
 
-    if (task.status === "queued" && ageMs >= staleQueuedMs) {
+    if (!isTaskFlowRepairProxy(task) && task.status === "queued" && ageMs >= staleQueuedMs) {
       findings.push(
         createFinding({
           severity: "warn",
@@ -134,7 +138,7 @@ export function listTaskAuditFindings(options: TaskAuditOptions = {}): TaskAudit
       );
     }
 
-    if (task.status === "running" && ageMs >= staleRunningMs) {
+    if (!isTaskFlowRepairProxy(task) && task.status === "running" && ageMs >= staleRunningMs) {
       findings.push(
         createFinding({
           severity: "error",

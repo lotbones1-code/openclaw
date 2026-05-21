@@ -8,6 +8,7 @@ const mocks = vi.hoisted(() => ({
   reliabilityStatusCommand: vi.fn(),
   sessionsCommand: vi.fn(),
   sessionsCleanupCommand: vi.fn(),
+  sessionsCompactCommand: vi.fn(),
   tasksListCommand: vi.fn(),
   tasksAuditCommand: vi.fn(),
   tasksMaintenanceCommand: vi.fn(),
@@ -30,6 +31,7 @@ const healthCommand = mocks.healthCommand;
 const reliabilityStatusCommand = mocks.reliabilityStatusCommand;
 const sessionsCommand = mocks.sessionsCommand;
 const sessionsCleanupCommand = mocks.sessionsCleanupCommand;
+const sessionsCompactCommand = mocks.sessionsCompactCommand;
 const tasksListCommand = mocks.tasksListCommand;
 const tasksAuditCommand = mocks.tasksAuditCommand;
 const tasksMaintenanceCommand = mocks.tasksMaintenanceCommand;
@@ -60,6 +62,10 @@ vi.mock("../../commands/sessions.js", () => ({
 
 vi.mock("../../commands/sessions-cleanup.js", () => ({
   sessionsCleanupCommand: mocks.sessionsCleanupCommand,
+}));
+
+vi.mock("../../commands/sessions-compact.js", () => ({
+  sessionsCompactCommand: mocks.sessionsCompactCommand,
 }));
 
 vi.mock("../../commands/tasks.js", () => ({
@@ -100,6 +106,7 @@ describe("registerStatusHealthSessionsCommands", () => {
     reliabilityStatusCommand.mockResolvedValue(undefined);
     sessionsCommand.mockResolvedValue(undefined);
     sessionsCleanupCommand.mockResolvedValue(undefined);
+    sessionsCompactCommand.mockResolvedValue(undefined);
     tasksListCommand.mockResolvedValue(undefined);
     tasksAuditCommand.mockResolvedValue(undefined);
     tasksMaintenanceCommand.mockResolvedValue(undefined);
@@ -262,6 +269,34 @@ describe("registerStatusHealthSessionsCommands", () => {
     expect(sessionsCleanupCommand).toHaveBeenCalledWith(
       expect.objectContaining({
         allAgents: true,
+      }),
+      runtime,
+    );
+  });
+
+  it("runs sessions compact subcommand with native scope options", async () => {
+    await runCli([
+      "sessions",
+      "--all-agents",
+      "compact",
+      "--dry-run",
+      "--min-tokens",
+      "1000000",
+      "--inactive-minutes",
+      "15",
+      "--max",
+      "2",
+      "--json",
+    ]);
+
+    expect(sessionsCompactCommand).toHaveBeenCalledWith(
+      expect.objectContaining({
+        allAgents: true,
+        dryRun: true,
+        minTokens: "1000000",
+        inactiveMinutes: "15",
+        max: "2",
+        json: true,
       }),
       runtime,
     );

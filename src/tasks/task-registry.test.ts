@@ -26,6 +26,7 @@ import {
   getTaskRegistrySummary,
   isParentFlowLinkError,
   listTasksForAgentId,
+  listTasksForFlowId,
   listTasksForOwnerKey,
   listTaskRecords,
   linkTaskToFlowById,
@@ -1503,6 +1504,93 @@ describe("task-registry", () => {
         byCode: expect.objectContaining({
           lost: 1,
         }),
+      });
+    });
+  });
+
+  it("repairs managed TaskFlow history into task registry rows during maintenance", async () => {
+    await withTaskRegistryTempDir(async (root) => {
+      process.env.OPENCLAW_STATE_DIR = root;
+      resetTaskRegistryForTests();
+      resetTaskFlowRegistryForTests();
+      const now = Date.now();
+
+      const flow = createManagedTaskFlow({
+        controllerId: "mission-runtime",
+        ownerKey: "mission-runtime:v2:novel-work",
+        notifyPolicy: "silent",
+        status: "running",
+        goal: "Source one novel wholesale channel",
+        currentStep: "mission_active",
+        stateJson: {
+          openclawMissionRuntime: {
+            version: 2,
+            missionId: "mission-v2",
+            decision: "spawn_agent",
+            workId: "mission-agent:novel",
+            proofPath: "/tmp/mission-v2.md#novel_agent",
+            expectedOutput: "completed novel bounded unit or exact typed gate",
+          },
+        },
+        createdAt: now - 60_000,
+        updatedAt: now - 30_000,
+      });
+
+      expect(listTasksForFlowId(flow.flowId)).toEqual([]);
+      expect(await runTaskRegistryMaintenance()).toMatchObject({
+        reconciled: 1,
+        recovered: 0,
+      });
+
+      const repaired = listTasksForFlowId(flow.flowId);
+      expect(repaired).toHaveLength(1);
+      expect(repaired[0]).toMatchObject({
+        runtime: "cli",
+        taskKind: "taskflow_repair",
+        sourceId: flow.flowId,
+        ownerKey: flow.ownerKey,
+        parentFlowId: flow.flowId,
+        runId: `taskflow:${flow.flowId}`,
+        status: "running",
+        task: "Source one novel wholesale channel",
+        terminalSummary: "Task registry row restored from managed TaskFlow state.",
+      });
+    });
+  });
+
+  it("keeps repaired TaskFlow proxy rows inspectable instead of marking them lost", async () => {
+    await withTaskRegistryTempDir(async (root) => {
+      process.env.OPENCLAW_STATE_DIR = root;
+      resetTaskRegistryForTests();
+      resetTaskFlowRegistryForTests();
+      const now = Date.now();
+
+      const flow = createManagedTaskFlow({
+        controllerId: "work-manager",
+        ownerKey: "work-manager:cron:old-queued",
+        notifyPolicy: "silent",
+        status: "queued",
+        goal: "Old queued work-manager unit",
+        currentStep: "admission_deferred",
+        createdAt: now - 2 * 60 * 60_000,
+        updatedAt: now - 2 * 60 * 60_000,
+      });
+
+      expect(await runTaskRegistryMaintenance()).toMatchObject({
+        reconciled: 1,
+      });
+      const repaired = listTasksForFlowId(flow.flowId)[0];
+      expect(repaired).toMatchObject({
+        taskKind: "taskflow_repair",
+        status: "queued",
+      });
+
+      expect(await runTaskRegistryMaintenance()).toMatchObject({
+        reconciled: 0,
+      });
+      expect(listTasksForFlowId(flow.flowId)[0]).toMatchObject({
+        taskKind: "taskflow_repair",
+        status: "queued",
       });
     });
   });

@@ -3045,18 +3045,51 @@ async function executeDetachedCronJob(
     return { status: "error", error: timeoutErrorMessage() };
   }
 
+  const normalized = normalizeMissionAgentProofOutcome(job, res);
+
   return {
-    status: res.status,
-    error: res.error,
-    summary: res.summary,
-    delivered: res.delivered,
-    deliveryAttempted: res.deliveryAttempted,
-    delivery: res.delivery,
-    sessionId: res.sessionId,
-    sessionKey: res.sessionKey,
-    model: res.model,
-    provider: res.provider,
-    usage: res.usage,
+    status: normalized.status,
+    error: normalized.error,
+    summary: normalized.summary,
+    delivered: normalized.delivered,
+    deliveryAttempted: normalized.deliveryAttempted,
+    delivery: normalized.delivery,
+    sessionId: normalized.sessionId,
+    sessionKey: normalized.sessionKey,
+    model: normalized.model,
+    provider: normalized.provider,
+    usage: normalized.usage,
+  };
+}
+
+function isMissionRuntimeAgentCronJob(job: CronJob): boolean {
+  return job.id.startsWith("mission-agent-") || /^Mission Agent\b/.test(job.name);
+}
+
+function normalizeMissionAgentProofOutcome<T extends CronRunOutcome & CronRunTelemetry>(
+  job: CronJob,
+  result: T & {
+    delivered?: boolean;
+    deliveryAttempted?: boolean;
+    delivery?: CronDeliveryTrace;
+  },
+): T & {
+  delivered?: boolean;
+  deliveryAttempted?: boolean;
+  delivery?: CronDeliveryTrace;
+} {
+  if (
+    !isMissionRuntimeAgentCronJob(job) ||
+    result.status !== "ok" ||
+    (typeof result.summary === "string" && result.summary.trim())
+  ) {
+    return result;
+  }
+  return {
+    ...result,
+    status: "error",
+    error: "NO_OUTPUT: mission agent exited without mandatory terminal proof summary",
+    summary: "NO_OUTPUT: mission agent exited without mandatory terminal proof summary",
   };
 }
 

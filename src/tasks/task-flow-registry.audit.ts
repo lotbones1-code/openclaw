@@ -90,6 +90,13 @@ function hasBlockingMetadata(flow: TaskFlowRecord): boolean {
   );
 }
 
+function blockedTaskIdIsNativeWorkManagerReference(flow: TaskFlowRecord, blockedTaskId: string) {
+  return (
+    flow.ownerKey === `work-manager:cron:${blockedTaskId}` ||
+    flow.ownerKey === `work-manager:timeout-split:${blockedTaskId}`
+  );
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -269,7 +276,10 @@ export function listTaskFlowAuditFindings(
 
     if (flow.blockedTaskId?.trim()) {
       const blockedTaskId = flow.blockedTaskId.trim();
-      if (!linkedTasks.some((task) => task.taskId === blockedTaskId)) {
+      if (
+        !blockedTaskIdIsNativeWorkManagerReference(flow, blockedTaskId) &&
+        !linkedTasks.some((task) => task.taskId === blockedTaskId)
+      ) {
         findings.push(
           createFinding({
             severity: "warn",

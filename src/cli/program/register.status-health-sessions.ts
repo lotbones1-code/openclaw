@@ -3,6 +3,7 @@ import { flowsCancelCommand, flowsListCommand, flowsShowCommand } from "../../co
 import { healthCommand } from "../../commands/health.js";
 import { reliabilityStatusCommand } from "../../commands/reliability.js";
 import { sessionsCleanupCommand } from "../../commands/sessions-cleanup.js";
+import { sessionsCompactCommand } from "../../commands/sessions-compact.js";
 import { sessionsCommand } from "../../commands/sessions.js";
 import { statusCommand } from "../../commands/status.js";
 import {
@@ -239,6 +240,47 @@ export function registerStatusHealthSessionsCommands(program: Command) {
       );
     });
   sessionsCmd.enablePositionalOptions();
+
+  sessionsCmd
+    .command("compact")
+    .description("Compact oversized inactive session transcripts")
+    .option("--store <path>", "Path to session store (default: resolved from config)")
+    .option("--agent <id>", "Agent id to compact (default: configured default agent)")
+    .option("--all-agents", "Compact across all configured agents", false)
+    .option("--key <sessionKey>", "Compact one exact session key")
+    .option("--min-tokens <n>", "Only compact sessions at or above this token count")
+    .option("--inactive-minutes <n>", "Skip sessions updated within this many minutes")
+    .option("--max <n>", "Maximum sessions to compact in one run")
+    .option("--dry-run", "Preview compaction candidates without writing", false)
+    .option("--force", "Allow recently active sessions to be compacted", false)
+    .option("--json", "Output JSON", false)
+    .action(async (opts, command) => {
+      const parentOpts = command.parent?.opts() as
+        | {
+            store?: string;
+            agent?: string;
+            allAgents?: boolean;
+            json?: boolean;
+          }
+        | undefined;
+      await runCommandWithRuntime(defaultRuntime, async () => {
+        await sessionsCompactCommand(
+          {
+            store: (opts.store as string | undefined) ?? parentOpts?.store,
+            agent: (opts.agent as string | undefined) ?? parentOpts?.agent,
+            allAgents: Boolean(opts.allAgents || parentOpts?.allAgents),
+            key: opts.key as string | undefined,
+            minTokens: opts.minTokens as string | undefined,
+            inactiveMinutes: opts.inactiveMinutes as string | undefined,
+            max: opts.max as string | undefined,
+            dryRun: Boolean(opts.dryRun),
+            force: Boolean(opts.force),
+            json: Boolean(opts.json || parentOpts?.json),
+          },
+          defaultRuntime,
+        );
+      });
+    });
 
   sessionsCmd
     .command("cleanup")

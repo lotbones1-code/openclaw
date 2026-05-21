@@ -109,6 +109,62 @@ describe("task-flow-registry maintenance", () => {
     });
   });
 
+  it("normalizes terminal flow timestamps during maintenance", async () => {
+    await withTaskFlowMaintenanceStateDir(async () => {
+      const now = Date.now();
+      const flow = createManagedTaskFlow({
+        ownerKey: "agent:main:main",
+        controllerId: "tests/task-flow-maintenance",
+        goal: "Finished with skewed timestamps",
+        status: "succeeded",
+        createdAt: now - 60_000,
+        updatedAt: now,
+        endedAt: now - 30_000,
+      });
+
+      expect(previewTaskFlowRegistryMaintenance()).toEqual({
+        reconciled: 1,
+        pruned: 0,
+      });
+      expect(await runTaskFlowRegistryMaintenance()).toEqual({
+        reconciled: 1,
+        pruned: 0,
+      });
+      expect(getTaskFlowById(flow.flowId)).toMatchObject({
+        endedAt: now,
+        updatedAt: now,
+      });
+    });
+  });
+
+  it("marks stale managed running flows without real active children as lost", async () => {
+    await withTaskFlowMaintenanceStateDir(async () => {
+      const now = Date.now();
+      const flow = createManagedTaskFlow({
+        ownerKey: "work-manager:timeout-split:stale-social",
+        controllerId: "work-manager",
+        goal: "Stale timeout split",
+        status: "running",
+        currentStep: "dispatched_by_work_manager",
+        createdAt: now - 2 * 60 * 60_000,
+        updatedAt: now - 2 * 60 * 60_000,
+      });
+
+      expect(previewTaskFlowRegistryMaintenance()).toEqual({
+        reconciled: 1,
+        pruned: 0,
+      });
+      expect(await runTaskFlowRegistryMaintenance()).toEqual({
+        reconciled: 1,
+        pruned: 0,
+      });
+      expect(getTaskFlowById(flow.flowId)).toMatchObject({
+        status: "lost",
+        blockedSummary: "stale running TaskFlow lost during native maintenance",
+      });
+    });
+  });
+
   it("does not finalize cancel-requested flows while a child task is still active", async () => {
     await withTaskFlowMaintenanceStateDir(async () => {
       const flow = createManagedTaskFlow({

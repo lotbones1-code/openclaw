@@ -16,12 +16,14 @@ export type MissionRuntimeDecisionReason =
   | "all_capabilities_gated"
   | "parallel_company_work"
   | "novel_agent_required"
+  | "self_acquire_required"
   | "self_improvement_required"
   | "personal_assistant_required";
 
 export type MissionRuntimeUnitKind =
   | "known_capability"
   | "novel_agent"
+  | "self_acquire"
   | "self_improvement"
   | "personal_assistant";
 
@@ -64,7 +66,7 @@ export type MissionRuntimeDispatchUnit =
     }
   | {
       action: "spawn_agent";
-      unitKind: Exclude<MissionRuntimeUnitKind, "known_capability">;
+      unitKind: MissionRuntimeUnitKind;
       workId: string;
       proofPath: string;
       expectedOutput: string;
@@ -83,6 +85,7 @@ export type MissionRuntimeDispatchPlan =
         | "queued_company_work"
         | "parallel_company_work"
         | "novel_agent_required"
+        | "self_acquire_required"
         | "self_improvement_required"
         | "personal_assistant_required"
       >;

@@ -5,6 +5,10 @@ import {
   buildWorkManagerSnapshot,
   type WorkManagerCandidate,
 } from "../work-manager/work-manager.js";
+import {
+  getMissionCapabilityDefinition,
+  listMissionCapabilityDefinitions,
+} from "./mission-capability-registry.js";
 import { selectMissionRuntimeDispatchPlan, selectMissionRuntimeUnit } from "./mission-runtime.js";
 
 const now = Date.parse("2026-05-21T12:00:00.000Z");
@@ -44,6 +48,35 @@ function candidate(overrides: Partial<WorkManagerCandidate> = {}): WorkManagerCa
 }
 
 describe("mission runtime", () => {
+  it("registers the core company capabilities as mission units with proof contracts", () => {
+    const capabilities = listMissionCapabilityDefinitions();
+
+    expect(capabilities.map((capability) => capability.capabilityId)).toEqual(
+      expect.arrayContaining([
+        "social-media-execution",
+        "trading-operations",
+        "content-creation",
+        "revenue-operations",
+        "market-intelligence",
+        "memory-learning",
+        "system-health",
+      ]),
+    );
+    for (const capability of capabilities) {
+      expect(capability.proofRequired.length).toBeGreaterThan(0);
+      expect(capability.requiredSkills.length + capability.requiredTools.length).toBeGreaterThan(0);
+      expect(capability.priorityHint).toMatch(/^P[0-4]/);
+      expect(capability.resourceRequirements.length).toBeGreaterThan(0);
+    }
+    expect(getMissionCapabilityDefinition("trading-operations")).toMatchObject({
+      requiresModelCouncil: true,
+      highStakes: true,
+    });
+    expect(getMissionCapabilityDefinition("social-media-execution")).toMatchObject({
+      requiresModelCouncil: true,
+    });
+  });
+
   it("creates a standing company mission when no explicit active mission exists", () => {
     const snapshot = buildWorkManagerSnapshot({
       nowMs: now,
@@ -193,6 +226,36 @@ describe("mission runtime", () => {
     expect(plan.suppressedCronJobIds).toEqual([]);
   });
 
+  it("dispatches registered capability units when no cron lane exists", () => {
+    const snapshot = buildWorkManagerSnapshot({
+      nowMs: now,
+      mode: "admission",
+      taskFlows: [],
+      tasks: [],
+      cronJobs: [],
+    });
+
+    const plan = selectMissionRuntimeDispatchPlan({
+      nowMs: now,
+      snapshot,
+      cronJobs: [],
+      queuedCandidates: [],
+      standingCompanyDirective: true,
+      maxParallelDispatch: 2,
+    });
+
+    expect(plan.decision).toBe("dispatch");
+    expect(plan.units[0]).toMatchObject({
+      action: "spawn_agent",
+      unitKind: "known_capability",
+      pool: "revenue",
+      priority: "P0",
+    });
+    expect(plan.units[0]?.workId).toContain("mission-capability:revenue-operations");
+    expect(plan.units[0]?.agentPacket?.prompt).toContain("Capability: Revenue Operations");
+    expect(plan.units[0]?.agentPacket?.prompt).toContain("Proof required:");
+  });
+
   it("creates a novel agent packet when no coded capability fits the mission", () => {
     const snapshot = buildWorkManagerSnapshot({
       nowMs: now,
@@ -256,6 +319,73 @@ describe("mission runtime", () => {
     expect(selfBuild?.agentPacket?.prompt).toContain("CAPABILITY_DEGRADED:social-red");
   });
 
+  it("marks auth failures as degraded capability gates", () => {
+    const authFailed = cronJob({
+      id: "gmail-outreach",
+      name: "Revenue Operations Email Outreach",
+      state: {
+        nextRunAtMs: now,
+        consecutiveErrors: 1,
+        lastRunStatus: "error",
+        lastError: "AUTH_EXPIRED: Gmail OAuth refresh failed",
+      },
+    });
+    const snapshot = buildWorkManagerSnapshot({
+      nowMs: now,
+      mode: "admission",
+      taskFlows: [],
+      tasks: [],
+      cronJobs: [authFailed],
+    });
+
+    const plan = selectMissionRuntimeDispatchPlan({
+      nowMs: now,
+      snapshot,
+      cronJobs: [authFailed],
+      queuedCandidates: [],
+      standingCompanyDirective: true,
+      maxParallelDispatch: 2,
+    });
+
+    expect(plan.exactGates).toContain("CAPABILITY_DEGRADED:gmail-outreach");
+    expect(plan.units.some((unit) => unit.unitKind === "self_improvement")).toBe(true);
+  });
+
+  it("creates a self-acquire packet when a mission needs a missing tool or skill", () => {
+    const snapshot = buildWorkManagerSnapshot({
+      nowMs: now,
+      mode: "admission",
+      taskFlows: [
+        missionFlow({
+          objective: "Find and install the best native MCP or skill for customer support tickets",
+          selectedOption: "self_acquire_customer_support_tool",
+        }),
+      ],
+      tasks: [],
+      cronJobs: [],
+    });
+
+    const plan = selectMissionRuntimeDispatchPlan({
+      nowMs: now,
+      snapshot,
+      cronJobs: [],
+      queuedCandidates: [],
+      maxParallelDispatch: 2,
+    });
+
+    expect(plan.decision).toBe("dispatch");
+    expect(plan.units[0]).toMatchObject({
+      action: "spawn_agent",
+      unitKind: "self_acquire",
+      pool: "build",
+      priority: "P1",
+    });
+    expect(plan.units[0]?.agentPacket?.prompt).toContain("Self-Acquire Contract");
+    expect(plan.units[0]?.agentPacket?.prompt).toContain("research existing MCP servers");
+    expect(plan.units[0]?.agentPacket?.prompt).toContain("install through native OpenClaw");
+    expect(plan.units[0]?.agentPacket?.prompt).toContain("self-build only as fallback");
+  });
+
   it("routes personal directives into personal-assistant agent packets", () => {
     const snapshot = buildWorkManagerSnapshot({
       nowMs: now,
@@ -285,6 +415,35 @@ describe("mission runtime", () => {
       priority: "P0_USER_DIRECTIVE",
     });
     expect(plan.units[0]?.agentPacket?.prompt).toContain("personal assistant");
+  });
+
+  it("requires mandatory terminal proof turns for spawned mission agents", () => {
+    const snapshot = buildWorkManagerSnapshot({
+      nowMs: now,
+      mode: "admission",
+      taskFlows: [
+        missionFlow({
+          objective: "Figure out a new wholesale portal",
+          selectedOption: "new_wholesale_portal",
+        }),
+      ],
+      tasks: [],
+      cronJobs: [],
+    });
+
+    const plan = selectMissionRuntimeDispatchPlan({
+      nowMs: now,
+      snapshot,
+      cronJobs: [],
+      queuedCandidates: [],
+      maxParallelDispatch: 2,
+    });
+
+    expect(plan.units[0]?.agentPacket?.prompt).toContain("Mandatory terminal proof turn");
+    expect(plan.units[0]?.agentPacket?.prompt).toContain("NO_OUTPUT");
+    expect(plan.units[0]?.agentPacket?.prompt).toContain("WORKER_TIMEOUT");
+    expect(plan.units[0]?.agentPacket?.prompt).toContain("CONTEXT_OVERFLOW");
+    expect(plan.units[0]?.agentPacket?.prompt).toContain("AUTH_EXPIRED");
   });
 });
 

@@ -346,6 +346,40 @@ describe("cron service timer regressions", () => {
     ).toBe(true);
   });
 
+  it("fails mission agent workers that exit without a mandatory proof summary", async () => {
+    const store = timerRegressionFixtures.makeStorePath();
+    const nowMs = Date.parse("2026-05-21T12:20:00.000Z");
+    const job = {
+      ...createDueIsolatedJob({
+        id: "mission-agent-no-output",
+        nowMs,
+        nextRunAtMs: nowMs,
+      }),
+      name: "Mission Agent — revenue operations",
+      payload: {
+        kind: "agentTurn",
+        message: "Run a registered mission capability and provide proof.",
+      },
+    } as CronJob;
+    await writeCronJobs(store.storePath, [job]);
+    const state = createCronServiceState({
+      cronEnabled: true,
+      storePath: store.storePath,
+      log: noopLogger,
+      nowMs: () => nowMs,
+      enqueueSystemEvent: vi.fn(),
+      requestHeartbeatNow: vi.fn(),
+      runIsolatedAgentJob: vi.fn(async () => ({ status: "ok" as const })),
+    });
+
+    await onTimer(state);
+
+    const updated = state.store?.jobs.find((entry) => entry.id === job.id);
+    expect(updated?.state.lastRunStatus).toBe("error");
+    expect(updated?.state.lastError).toContain("NO_OUTPUT");
+    expect(updated?.state.consecutiveErrors).toBe(1);
+  });
+
   it("re-arms timer without hot-looping when a run is already in progress", async () => {
     const timeoutSpy = vi.spyOn(globalThis, "setTimeout");
     const store = timerRegressionFixtures.makeStorePath();

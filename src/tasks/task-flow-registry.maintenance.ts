@@ -13,6 +13,7 @@ import {
 import type { TaskFlowRecord } from "./task-flow-registry.types.js";
 
 const TASK_FLOW_RETENTION_MS = 7 * 24 * 60 * 60_000;
+const TASK_FLOW_STALE_RUNNING_MS = 30 * 60_000;
 
 export type TaskFlowRegistryMaintenanceSummary = {
   reconciled: number;
@@ -34,6 +35,14 @@ function hasActiveLinkedTasks(flowId: string): boolean {
   );
 }
 
+function hasActiveRealLinkedTasks(flowId: string): boolean {
+  return listTasksForFlowId(flowId).some(
+    (task) =>
+      task.taskKind !== "taskflow_repair" &&
+      (task.status === "queued" || task.status === "running"),
+  );
+}
+
 function resolveTerminalAt(flow: TaskFlowRecord): number {
   return flow.endedAt ?? flow.updatedAt ?? flow.createdAt;
 }
@@ -46,6 +55,102 @@ function shouldPruneFlow(flow: TaskFlowRecord, now: number): boolean {
     return false;
   }
   return now - resolveTerminalAt(flow) >= TASK_FLOW_RETENTION_MS;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isActiveOpenClawMissionFlow(flow: TaskFlowRecord): boolean {
+  if (
+    flow.goal !== "OpenClaw Mission Contract" &&
+    flow.ownerKey !== "work-manager:mission:current"
+  ) {
+    return false;
+  }
+  const mission = isRecord(flow.stateJson) ? flow.stateJson.openclawMission : undefined;
+  return isRecord(mission) && mission.status === "active";
+}
+
+function shouldNormalizeTerminalTimestamps(flow: TaskFlowRecord): boolean {
+  return (
+    isTerminalFlow(flow) &&
+    typeof flow.endedAt === "number" &&
+    (flow.endedAt < flow.createdAt || flow.endedAt < flow.updatedAt)
+  );
+}
+
+function normalizeTerminalTimestamps(flow: TaskFlowRecord): boolean {
+  let current = flow;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    if (!shouldNormalizeTerminalTimestamps(current)) {
+      return false;
+    }
+    const endedAt = Math.max(
+      current.endedAt ?? current.updatedAt,
+      current.updatedAt,
+      current.createdAt,
+    );
+    const result = updateFlowRecordByIdExpectedRevision({
+      flowId: current.flowId,
+      expectedRevision: current.revision,
+      patch: {
+        endedAt,
+        updatedAt: Math.max(current.updatedAt, endedAt),
+      },
+    });
+    if (result.applied) {
+      return true;
+    }
+    if (result.reason === "not_found" || !result.current) {
+      return false;
+    }
+    current = result.current;
+  }
+  return false;
+}
+
+function shouldMarkStaleRunningManagedFlowLost(flow: TaskFlowRecord, now: number): boolean {
+  if (flow.syncMode !== "managed" || flow.status !== "running") {
+    return false;
+  }
+  if (isActiveOpenClawMissionFlow(flow)) {
+    return false;
+  }
+  if (hasActiveRealLinkedTasks(flow.flowId)) {
+    return false;
+  }
+  return now - flow.updatedAt >= TASK_FLOW_STALE_RUNNING_MS;
+}
+
+function markStaleRunningManagedFlowLost(flow: TaskFlowRecord, now: number): boolean {
+  let current = flow;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    if (!shouldMarkStaleRunningManagedFlowLost(current, now)) {
+      return false;
+    }
+    const endedAt = Math.max(now, current.updatedAt, current.createdAt);
+    const result = updateFlowRecordByIdExpectedRevision({
+      flowId: current.flowId,
+      expectedRevision: current.revision,
+      patch: {
+        status: "lost",
+        blockedTaskId: null,
+        blockedSummary: "stale running TaskFlow lost during native maintenance",
+        waitJson: null,
+        endedAt,
+        updatedAt: endedAt,
+      },
+    });
+    if (result.applied) {
+      return true;
+    }
+    if (result.reason === "not_found" || !result.current) {
+      return false;
+    }
+    current = result.current;
+  }
+  return false;
 }
 
 function shouldFinalizeCancelledFlow(flow: TaskFlowRecord): boolean {
@@ -101,6 +206,14 @@ export function previewTaskFlowRegistryMaintenance(): TaskFlowRegistryMaintenanc
       reconciled += 1;
       continue;
     }
+    if (shouldNormalizeTerminalTimestamps(flow)) {
+      reconciled += 1;
+      continue;
+    }
+    if (shouldMarkStaleRunningManagedFlowLost(flow, now)) {
+      reconciled += 1;
+      continue;
+    }
     if (shouldPruneFlow(flow, now)) {
       pruned += 1;
     }
@@ -119,6 +232,18 @@ export async function runTaskFlowRegistryMaintenance(): Promise<TaskFlowRegistry
     }
     if (shouldFinalizeCancelledFlow(current)) {
       if (finalizeCancelledFlow(current, now)) {
+        reconciled += 1;
+      }
+      continue;
+    }
+    if (shouldNormalizeTerminalTimestamps(current)) {
+      if (normalizeTerminalTimestamps(current)) {
+        reconciled += 1;
+      }
+      continue;
+    }
+    if (shouldMarkStaleRunningManagedFlowLost(current, now)) {
+      if (markStaleRunningManagedFlowLost(current, now)) {
         reconciled += 1;
       }
       continue;

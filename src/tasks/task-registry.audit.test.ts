@@ -79,6 +79,9 @@ describe("task-registry audit", () => {
         delivery_failed: 1,
         missing_cleanup: 0,
         inconsistent_timestamps: 0,
+        REPORTING_DEFECT: 0,
+        STALE_TASK_WRAPPER: 0,
+        TASK_REGISTRY_MISMATCH: 0,
       },
     });
   });
@@ -113,6 +116,34 @@ describe("task-registry audit", () => {
       ["lost-expired", "lost", "error"],
       ["lost-retained", "lost", "warn"],
     ]);
+  });
+
+  it("does not treat synthetic TaskFlow repair proxy rows as stale workers", () => {
+    const now = Date.parse("2026-03-30T01:00:00.000Z");
+    const findings = listTaskAuditFindings({
+      now,
+      tasks: [
+        createTask({
+          taskId: "flow-proxy-running",
+          runtime: "cli",
+          taskKind: "taskflow_repair",
+          status: "running",
+          createdAt: now - 2 * 60 * 60_000,
+          startedAt: now - 2 * 60 * 60_000,
+          lastEventAt: now - 2 * 60 * 60_000,
+        }),
+        createTask({
+          taskId: "flow-proxy-queued",
+          runtime: "cli",
+          taskKind: "taskflow_repair",
+          status: "queued",
+          createdAt: now - 2 * 60 * 60_000,
+          lastEventAt: now - 2 * 60 * 60_000,
+        }),
+      ],
+    });
+
+    expect(findings).toEqual([]);
   });
 
   it("does not double-report lost tasks as missing cleanup", () => {

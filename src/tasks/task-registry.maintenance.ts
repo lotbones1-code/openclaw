@@ -10,9 +10,11 @@ import { parseAgentSessionKey } from "../routing/session-key.js";
 import { normalizeLowercaseStringOrEmpty } from "../shared/string-coerce.js";
 import { tryRecoverTaskBeforeMarkLost } from "./detached-task-runtime.js";
 import {
+  createTaskRecord,
   deleteTaskRecordById,
   ensureTaskRegistryReady,
   getTaskById,
+  listTasksForFlowId,
   listTaskRecords,
   markTaskLostById,
   markTaskTerminalById,
@@ -25,6 +27,8 @@ import {
   type TaskControlCommand,
   type TaskControlRecord,
 } from "./task-control-registry.js";
+import { listTaskFlowRecords } from "./task-flow-registry.js";
+import type { TaskFlowRecord, TaskFlowStatus } from "./task-flow-registry.types.js";
 import {
   configureTaskAuditTaskProvider,
   listTaskAuditFindings,
@@ -129,6 +133,13 @@ type CronRecoveryContext = {
   runLogsByJobId: Map<string, CronRunLogEntry[]>;
 };
 
+const ACTIVE_TASKFLOW_STATUSES = new Set<TaskFlowStatus>([
+  "queued",
+  "running",
+  "waiting",
+  "blocked",
+]);
+
 function createCronRecoveryContext(): CronRecoveryContext {
   return {
     storePath: taskRegistryMaintenanceRuntime.resolveCronStorePath(),
@@ -156,6 +167,78 @@ function isActiveTask(task: TaskRecord): boolean {
 
 function isTerminalTask(task: TaskRecord): boolean {
   return !isActiveTask(task);
+}
+
+function taskStatusFromManagedFlow(flow: TaskFlowRecord): TaskStatus | undefined {
+  switch (flow.status) {
+    case "queued":
+    case "waiting":
+    case "blocked":
+      return "queued";
+    case "running":
+      return "running";
+    case "succeeded":
+      return "succeeded";
+    case "failed":
+      return "failed";
+    case "cancelled":
+      return "cancelled";
+    case "lost":
+      return "lost";
+  }
+}
+
+function shouldRepairManagedFlowTaskLink(flow: TaskFlowRecord): boolean {
+  if (flow.syncMode !== "managed") {
+    return false;
+  }
+  if (!ACTIVE_TASKFLOW_STATUSES.has(flow.status)) {
+    return false;
+  }
+  const linkedTasks = listTasksForFlowId(flow.flowId);
+  if (linkedTasks.some((task) => isActiveTask(task) && task.taskKind !== "taskflow_repair")) {
+    return false;
+  }
+  return !linkedTasks.some((task) => isActiveTask(task) && task.taskKind === "taskflow_repair");
+}
+
+function repairManagedTaskFlowTaskLinks(): number {
+  let repaired = 0;
+  for (const flow of listTaskFlowRecords()) {
+    if (!shouldRepairManagedFlowTaskLink(flow)) {
+      continue;
+    }
+    const status = taskStatusFromManagedFlow(flow);
+    if (!status) {
+      continue;
+    }
+    for (const existing of listTasksForFlowId(flow.flowId)) {
+      if (existing.taskKind === "taskflow_repair" && !isActiveTask(existing)) {
+        deleteTaskRecordById(existing.taskId);
+      }
+    }
+    createTaskRecord({
+      runtime: "cli",
+      taskKind: "taskflow_repair",
+      sourceId: flow.flowId,
+      requesterSessionKey: flow.ownerKey,
+      ownerKey: flow.ownerKey,
+      scopeKind: "session",
+      parentFlowId: flow.flowId,
+      runId: `taskflow:${flow.flowId}`,
+      label: `Managed TaskFlow ${flow.controllerId ?? "unknown"}`,
+      task: flow.goal,
+      status,
+      deliveryStatus: "not_applicable",
+      notifyPolicy: "silent",
+      ...(status === "running" ? { startedAt: flow.updatedAt } : {}),
+      lastEventAt: flow.updatedAt,
+      progressSummary: flow.currentStep,
+      terminalSummary: "Task registry row restored from managed TaskFlow state.",
+    });
+    repaired += 1;
+  }
+  return repaired;
 }
 
 function hasLostGraceExpired(task: TaskRecord, now: number): boolean {
@@ -433,6 +516,9 @@ function shouldMarkLost(task: TaskRecord, now: number): boolean {
   if (!isActiveTask(task)) {
     return false;
   }
+  if (task.taskKind === "taskflow_repair") {
+    return false;
+  }
   if (!hasLostGraceExpired(task, now)) {
     return false;
   }
@@ -632,7 +718,7 @@ export function reconcileTaskLookupToken(token: string): TaskRecord | undefined 
 export function previewTaskRegistryMaintenance(): TaskRegistryMaintenanceSummary {
   taskRegistryMaintenanceRuntime.ensureTaskRegistryReady();
   const now = Date.now();
-  let reconciled = 0;
+  let reconciled = listTaskFlowRecords().filter(shouldRepairManagedFlowTaskLink).length;
   let recovered = 0;
   let cleanupStamped = 0;
   let pruned = 0;
@@ -684,7 +770,7 @@ function startScheduledSweep() {
 export async function runTaskRegistryMaintenance(): Promise<TaskRegistryMaintenanceSummary> {
   taskRegistryMaintenanceRuntime.ensureTaskRegistryReady();
   const now = Date.now();
-  let reconciled = 0;
+  let reconciled = repairManagedTaskFlowTaskLinks();
   let recovered = 0;
   let cleanupStamped = 0;
   let pruned = 0;

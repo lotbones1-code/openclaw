@@ -8,6 +8,10 @@ import {
   type WorkManagerCandidate,
   type WorkManagerSnapshot,
 } from "../work-manager/work-manager.js";
+import {
+  listMissionCapabilityDefinitions,
+  type MissionCapabilityDefinition,
+} from "./mission-capability-registry.js";
 import type {
   MissionAgentPacket,
   MissionRuntimeDecision,
@@ -178,6 +182,7 @@ export function selectMissionRuntimeDispatchPlan(params: {
   maxParallelDispatch?: number;
   novelAgentEnabled?: boolean;
   selfImprovementEnabled?: boolean;
+  selfAcquireEnabled?: boolean;
   personalAssistantEnabled?: boolean;
   agentModel?: string;
 }): MissionRuntimeDispatchPlan {
@@ -302,7 +307,17 @@ export function selectMissionRuntimeDispatchPlan(params: {
     reservedResources,
     novelAgentEnabled: params.novelAgentEnabled !== false,
     selfImprovementEnabled: params.selfImprovementEnabled !== false,
+    selfAcquireEnabled: params.selfAcquireEnabled !== false,
     personalAssistantEnabled: params.personalAssistantEnabled !== false,
+    agentModel: params.agentModel ?? DEFAULT_MISSION_AGENT_MODEL,
+  });
+
+  appendRegistryCapabilityUnits({
+    units,
+    mission,
+    nowMs: params.nowMs,
+    parallelLimit,
+    reservedResources,
     agentModel: params.agentModel ?? DEFAULT_MISSION_AGENT_MODEL,
   });
 
@@ -512,16 +527,24 @@ function appendGeneratedMissionAgentUnits(params: {
   reservedResources: Set<string>;
   novelAgentEnabled: boolean;
   selfImprovementEnabled: boolean;
+  selfAcquireEnabled: boolean;
   personalAssistantEnabled: boolean;
   agentModel: string;
 }): void {
-  const objectiveText = missionText(params.mission);
+  const objectiveText = missionCoreText(params.mission);
   if (
     params.units.length < params.parallelLimit &&
     params.personalAssistantEnabled &&
     isPersonalAssistantMission(objectiveText)
   ) {
     appendAgentUnit(params, "personal_assistant");
+  }
+  if (
+    params.units.length < params.parallelLimit &&
+    params.selfAcquireEnabled &&
+    shouldSpawnSelfAcquireAgent(objectiveText)
+  ) {
+    appendAgentUnit(params, "self_acquire");
   }
   if (
     params.units.length < params.parallelLimit &&
@@ -537,6 +560,111 @@ function appendGeneratedMissionAgentUnits(params: {
   ) {
     appendAgentUnit(params, "novel_agent");
   }
+}
+
+function appendRegistryCapabilityUnits(params: {
+  units: MissionRuntimeDispatchUnit[];
+  mission: OpenClawMissionContract;
+  nowMs: number;
+  parallelLimit: number;
+  reservedResources: Set<string>;
+  agentModel: string;
+}): void {
+  if (!shouldUseCapabilityRegistry(params.mission)) {
+    return;
+  }
+  for (const capability of rankedMissionCapabilities(params.mission)) {
+    if (params.units.length >= params.parallelLimit) {
+      return;
+    }
+    if (capability.status !== "available") {
+      continue;
+    }
+    if (!canReserveResources(capability.resourceRequirements, params.reservedResources)) {
+      continue;
+    }
+    reserveResources(capability.resourceRequirements, params.reservedResources);
+    const packet = buildMissionCapabilityAgentPacket({
+      mission: params.mission,
+      capability,
+      nowMs: params.nowMs,
+      agentModel: params.agentModel,
+    });
+    params.units.push({
+      action: "spawn_agent",
+      unitKind: "known_capability",
+      workId: packet.workId,
+      proofPath: packet.proofPath,
+      expectedOutput: packet.expectedOutput,
+      requestedResources: capability.resourceRequirements,
+      priority: capability.priorityHint,
+      pool: capability.pool,
+      agentPacket: packet,
+    });
+  }
+}
+
+function buildMissionCapabilityAgentPacket(params: {
+  mission: OpenClawMissionContract;
+  capability: MissionCapabilityDefinition;
+  nowMs: number;
+  agentModel: string;
+}): MissionAgentPacket {
+  const workId = `mission-capability:${params.capability.capabilityId}:${params.mission.mission_id}`;
+  const proofPath = `${params.mission.proof_path}#${params.capability.capabilityId}`;
+  const objective = `Execute one bounded ${params.capability.label} unit for mission: ${params.mission.objective}`;
+  return {
+    workId,
+    taskClass: "known_capability",
+    objective,
+    model: params.agentModel,
+    proofPath,
+    expectedOutput: params.capability.proofRequired.join(", "),
+    timeoutMs: 30 * 60_000,
+    skillHints: params.capability.requiredSkills,
+    toolHints: params.capability.requiredTools,
+    prompt: buildMissionCapabilityAgentPrompt({
+      mission: params.mission,
+      capability: params.capability,
+      objective,
+      proofPath,
+    }),
+  };
+}
+
+function buildMissionCapabilityAgentPrompt(params: {
+  mission: OpenClawMissionContract;
+  capability: MissionCapabilityDefinition;
+  objective: string;
+  proofPath: string;
+}): string {
+  return [
+    "Run this as a registered OpenClaw mission capability unit.",
+    "",
+    `Mission id: ${params.mission.mission_id}`,
+    `Mission objective: ${params.mission.objective}`,
+    `Selected option: ${params.mission.selected_option}`,
+    `Capability: ${params.capability.label}`,
+    `Capability id: ${params.capability.capabilityId}`,
+    `Capability description: ${params.capability.description}`,
+    `Task objective: ${params.objective}`,
+    `Proof path: ${params.proofPath}`,
+    `Required tools: ${params.capability.requiredTools.join(", ")}`,
+    `Required skills: ${params.capability.requiredSkills.join(", ")}`,
+    `Proof required: ${params.capability.proofRequired.join(", ")}`,
+    `Hard gates: ${params.capability.hardGates.join(", ") || "none"}`,
+    params.capability.requiresModelCouncil
+      ? "Model-council-native is required before high-stakes execution."
+      : "Model-council-native is not required for this bounded unit unless a high-stakes action appears.",
+    "",
+    "Mandatory terminal proof turn: before exit, write a concise terminal summary with what shipped, proof path, exact gate if any, counters, next safe unit, and whether this was TOOL_CONNECTED or TOOL_USED.",
+    "If the worker hits AUTH_EXPIRED, CONTEXT_OVERFLOW, WORKER_TIMEOUT, NO_OUTPUT, or MISSING_PROOF, report that exact failure type. Do not count it as progress.",
+    "",
+    "Native constraints: use TaskFlow, Work Manager, native cron/task/session state, native browser profiles, vault proof logs, Learning OS, and native secrets/config only.",
+    "Do not add wrappers, host cron, side daemons, fake browser paths, direct provider shortcuts, standalone Python, or a parallel DB.",
+    "Do not mutate payment, DNS, billing, account security, public social, customer records, browser state, trades, purchases, credits, or top-ups unless an exact directive and pre-action verifier allow it.",
+    "If blocked, return one exact typed gate and a next safe fallback.",
+  ].join("\n");
 }
 
 function appendAgentUnit(
@@ -599,7 +727,16 @@ function buildMissionAgentPacket(params: {
     "revenue-operator",
     "self-builder-contract",
   ];
-  const toolHints = ["full native MCP/tools registry", "native browser profiles", "TaskFlow"];
+  const capabilityHints = listMissionCapabilityDefinitions().map(
+    (capability) =>
+      `${capability.capabilityId}: tools=${capability.requiredTools.join("+")}; skills=${capability.requiredSkills.join("+")}; proof=${capability.proofRequired.join("+")}`,
+  );
+  const toolHints = [
+    "full native MCP/tools registry",
+    "native browser profiles",
+    "TaskFlow",
+    ...capabilityHints,
+  ];
   return {
     workId,
     taskClass,
@@ -634,9 +771,11 @@ function buildMissionAgentPrompt(params: {
   const intro =
     params.unitKind === "self_improvement"
       ? "Run this under the Self-Builder Contract."
-      : params.unitKind === "personal_assistant"
-        ? "Run this as a personal assistant mission for Shamil."
-        : "Run this as a novel mission agent task.";
+      : params.unitKind === "self_acquire"
+        ? "Run this under the Self-Acquire Contract."
+        : params.unitKind === "personal_assistant"
+          ? "Run this as a personal assistant mission for Shamil."
+          : "Run this as a novel mission agent task.";
   return [
     intro,
     "",
@@ -650,6 +789,15 @@ function buildMissionAgentPrompt(params: {
     "Use the available MCP tools and native OpenClaw tool registry. Discover the right tool instead of assuming a hardcoded path.",
     "Use the available OpenClaw skills when relevant. Skill hints: " + params.skillHints.join(", "),
     "Tool hints: " + params.toolHints.join(", "),
+    "",
+    "Mandatory terminal proof turn: before exit, write a concise terminal summary with what shipped, proof path, exact gate if any, counters, next safe unit, and whether this was TOOL_CONNECTED or TOOL_USED.",
+    "If the worker hits AUTH_EXPIRED, CONTEXT_OVERFLOW, WORKER_TIMEOUT, NO_OUTPUT, or MISSING_PROOF, report that exact failure type. Do not count it as progress.",
+    params.unitKind === "self_acquire"
+      ? "Self-Acquire Contract: research existing MCP servers and skills, compare options, install through native OpenClaw commands only, register as a mission capability, test it, and self-build only as fallback when no existing tool fits."
+      : "",
+    params.unitKind === "self_acquire"
+      ? "Never add wrappers, host cron, side daemons, fake browser paths, provider shortcuts, standalone Python, or a parallel DB during self-acquire."
+      : "",
     "",
     "Native constraints: use TaskFlow, Work Manager, native cron/task/session state, native browser profiles, vault proof logs, Learning OS, and native secrets/config only.",
     "Do not add wrappers, host cron, side daemons, fake browser paths, direct provider shortcuts, or a parallel DB.",
@@ -666,6 +814,9 @@ function missionAgentObjective(
   if (unitKind === "self_improvement") {
     return `Fix the native capability gap causing ${exactGates.join(", ") || "mission degradation"} with the smallest tested OpenClaw source change.`;
   }
+  if (unitKind === "self_acquire") {
+    return `Acquire the missing native tool or skill needed for mission work: ${mission.objective}`;
+  }
   if (unitKind === "personal_assistant") {
     return `Execute the personal assistant request safely: ${mission.objective}`;
   }
@@ -678,6 +829,8 @@ function missionAgentExpectedOutput(
   switch (unitKind) {
     case "self_improvement":
       return "tested native source fix or exact source/test gate";
+    case "self_acquire":
+      return "researched, installed, registered, and tested native capability or exact acquire gate";
     case "personal_assistant":
       return "completed personal assistant unit or exact typed gate";
     case "novel_agent":
@@ -691,6 +844,8 @@ function agentUnitResources(
   switch (unitKind) {
     case "self_improvement":
       return ["repo:openclaw-runtime-src", "mission_agent:self_improvement"];
+    case "self_acquire":
+      return ["repo:openclaw-runtime-src", "mission_agent:self_acquire", "native_tool_registry"];
     case "personal_assistant":
       return ["mission_agent:personal_assistant"];
     case "novel_agent":
@@ -710,22 +865,83 @@ function agentUnitPool(
   if (unitKind === "self_improvement") {
     return "build";
   }
+  if (unitKind === "self_acquire") {
+    return "build";
+  }
   if (unitKind === "personal_assistant") {
     return "personal";
   }
   return "research";
 }
 
-function missionText(mission: OpenClawMissionContract): string {
-  return [
-    mission.user_request,
-    mission.selected_option,
-    mission.objective,
-    ...mission.allowed_lanes,
-    ...mission.success_criteria,
-  ]
-    .join(" ")
-    .toLowerCase();
+function missionCoreText(mission: OpenClawMissionContract): string {
+  return [mission.user_request, mission.selected_option, mission.objective].join(" ").toLowerCase();
+}
+
+function shouldUseCapabilityRegistry(mission: OpenClawMissionContract): boolean {
+  const text = missionCoreText(mission);
+  if (shouldSpawnSelfAcquireAgent(text)) {
+    return false;
+  }
+  return (
+    mission.selected_option === "standing_company_directive" ||
+    /\b(sales?|revenue|buyer|outreach|content|social|market|research|memory|learning|system health|task audit|session|trading|hyperliquid|email|dns|dmarc|dkim)\b/.test(
+      text,
+    )
+  );
+}
+
+function rankedMissionCapabilities(
+  mission: OpenClawMissionContract,
+): MissionCapabilityDefinition[] {
+  const text = missionCoreText(mission);
+  return listMissionCapabilityDefinitions()
+    .map((capability) => ({
+      capability,
+      score: missionCapabilityScore(capability, text),
+    }))
+    .filter((entry) => entry.score > 0)
+    .sort(
+      (a, b) =>
+        b.score - a.score ||
+        priorityScore(b.capability.priorityHint) - priorityScore(a.capability.priorityHint) ||
+        a.capability.capabilityId.localeCompare(b.capability.capabilityId),
+    )
+    .map((entry) => entry.capability);
+}
+
+function missionCapabilityScore(capability: MissionCapabilityDefinition, text: string): number {
+  let score = priorityScore(capability.priorityHint) + poolScore(capability.pool);
+  if (capability.capabilityId === "revenue-operations") {
+    score += /\b(sales?|revenue|buyer|lead|outreach|company|titan)\b/.test(text) ? 90 : 0;
+  }
+  if (capability.capabilityId === "content-creation") {
+    score += /\b(content|asset|copy|blog|marketing|creative|packet)\b/.test(text) ? 80 : 0;
+  }
+  if (capability.capabilityId === "social-media-execution") {
+    score += /\b(social|instagram|ig|x|twitter|post|comment|dm|reel)\b/.test(text) ? 75 : 0;
+  }
+  if (capability.capabilityId === "market-intelligence") {
+    score += /\b(market|research|competitor|customer|buyer signal|feedback)\b/.test(text) ? 70 : 0;
+  }
+  if (capability.capabilityId === "system-health") {
+    score += /\b(system health|config|task audit|session|cron|disk|reliability)\b/.test(text)
+      ? 95
+      : 0;
+  }
+  if (capability.capabilityId === "memory-learning") {
+    score += /\b(memory|learning|lesson|obsidian|vault|state)\b/.test(text) ? 65 : 0;
+  }
+  if (capability.capabilityId === "trading-operations") {
+    score += /\b(trading|trade|hyperliquid|position|market order)\b/.test(text) ? 100 : 0;
+  }
+  if (capability.capabilityId === "dns-email-setup") {
+    score += /\b(dns|dmarc|dkim|spf|workspace billing|email setup)\b/.test(text) ? 90 : 0;
+  }
+  if (capability.capabilityId === "self-acquire") {
+    score += shouldSpawnSelfAcquireAgent(text) ? 100 : 0;
+  }
+  return score;
 }
 
 function isPersonalAssistantMission(text: string): boolean {
@@ -736,13 +952,16 @@ function isPersonalAssistantMission(text: string): boolean {
 
 function shouldSpawnNovelAgent(
   text: string,
-  selectedUnits: readonly MissionRuntimeDispatchUnit[],
+  _selectedUnits: readonly MissionRuntimeDispatchUnit[],
 ): boolean {
-  return (
-    selectedUnits.length === 0 ||
-    /\b(novel|new|unknown|figure out|supplier|portal|integration|tool|research|source|evaluate|first time|not coded)\b/.test(
-      text,
-    )
+  return /\b(novel|new|unknown|figure out|supplier|portal|integration|tool|research|source|evaluate|first time|not coded)\b/.test(
+    text,
+  );
+}
+
+function shouldSpawnSelfAcquireAgent(text: string): boolean {
+  return /\b(self[- ]?acquire|install|get skills?|mcp|tool registry|missing tool|missing skill|capability gap|plugin|integration)\b/.test(
+    text,
   );
 }
 
@@ -754,6 +973,7 @@ function dispatchReasonForUnits(
   | "queued_company_work"
   | "parallel_company_work"
   | "novel_agent_required"
+  | "self_acquire_required"
   | "self_improvement_required"
   | "personal_assistant_required"
 > {
@@ -762,6 +982,9 @@ function dispatchReasonForUnits(
   }
   if (units.some((unit) => unit.unitKind === "self_improvement")) {
     return "self_improvement_required";
+  }
+  if (units.some((unit) => unit.unitKind === "self_acquire")) {
+    return "self_acquire_required";
   }
   if (units.some((unit) => unit.unitKind === "novel_agent")) {
     return "novel_agent_required";
@@ -791,7 +1014,7 @@ function isCapabilityDegraded(job: CronJob): boolean {
     consecutiveErrors >= DEGRADED_CAPABILITY_ERROR_THRESHOLD ||
     (job.state.lastRunStatus === "error" &&
       typeof job.state.lastError === "string" &&
-      /timeout|context overflow|no output|delivery_failed|gateway restart/i.test(
+      /auth_expired|oauth|unauthorized|401|403|timeout|context overflow|no output|delivery_failed|gateway restart/i.test(
         job.state.lastError,
       ))
   );

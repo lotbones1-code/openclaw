@@ -139,6 +139,31 @@ describe("task-flow-registry audit", () => {
     });
   });
 
+  it("does not treat native work-manager cron ids as missing task ids", async () => {
+    await withTaskFlowAuditStateDir(async () => {
+      const flow = createManagedTaskFlow({
+        ownerKey: "work-manager:cron:daily-revenue",
+        controllerId: "work-manager",
+        goal: "Daily Revenue",
+        status: "queued",
+        currentStep: "admission_deferred",
+        blockedTaskId: "daily-revenue",
+        blockedSummary: "work manager deferred cron job: resource_locked",
+        createdAt: 1,
+        updatedAt: 1,
+      });
+
+      expect(listTaskFlowAuditFindings({ now: 31 * 60_000 })).not.toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            code: "blocked_task_missing",
+            flow: expect.objectContaining({ flowId: flow.flowId }),
+          }),
+        ]),
+      );
+    });
+  });
+
   it("does not flag managed flows with active linked tasks as missing", async () => {
     await withTaskFlowAuditStateDir(async () => {
       const flow = createManagedTaskFlow({
