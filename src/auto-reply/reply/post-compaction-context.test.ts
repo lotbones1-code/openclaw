@@ -70,6 +70,59 @@ Not relevant.
     expect(result).not.toContain("Other Section");
   });
 
+  it("injects current compact OpenClaw authority sections by default", async () => {
+    fs.writeFileSync(
+      path.join(tmpDir, "AGENTS.md"),
+      [
+        "# AGENTS.md",
+        "",
+        "## Authority Order",
+        "Latest Shamil instruction wins.",
+        "",
+        "## Native Only",
+        "No wrappers.",
+        "",
+        "## Stop And Interrupt",
+        "Stop is runtime behavior.",
+        "",
+        "## Proof And Reporting",
+        "Prep is not execution.",
+      ].join("\n"),
+    );
+
+    const result = await readPostCompactionContext(tmpDir, {
+      nowMs: Date.UTC(2026, 2, 3, 14, 0, 0),
+    });
+
+    expect(result).toContain("Authority Order");
+    expect(result).toContain("Native Only");
+    expect(result).toContain("Stop And Interrupt");
+    expect(result).toContain("Proof And Reporting");
+    expect(result).not.toContain("Session Startup");
+  });
+
+  it("does not silently truncate required compact authority sections", async () => {
+    fs.writeFileSync(
+      path.join(tmpDir, "AGENTS.md"),
+      [
+        "# AGENTS.md",
+        "",
+        "## Authority Order",
+        "A".repeat(4000),
+        "",
+        "## Native Only",
+        "No wrappers.",
+      ].join("\n"),
+    );
+
+    await expect(
+      readPostCompactionContext(tmpDir, {
+        nowMs: Date.UTC(2026, 2, 3, 14, 0, 0),
+        cfg: { executionKernel: { contextAuthority: { enabled: true } } } as never,
+      }),
+    ).rejects.toThrow(/BOOTSTRAP_CRITICAL_AUTHORITY_INVALID/);
+  });
+
   it("extracts Red Lines section", async () => {
     const content = `# Rules
 
@@ -378,12 +431,12 @@ Read WORKFLOW.md on startup.
       expect(result).toContain("Boot Sequence");
     });
 
-    it("uses default 'Session Startup' prose when default sections are active", async () => {
+    it("uses generic prose when default compact sections fall back to legacy Session Startup", async () => {
       const content = `## Session Startup\n\nDo startup.\n`;
       fs.writeFileSync(path.join(tmpDir, "AGENTS.md"), content);
       const result = await readPostCompactionContext(tmpDir);
       expect(result).not.toBeNull();
-      expect(result).toContain("Run your Session Startup sequence");
+      expect(result).toContain("follow your configured startup procedure");
     });
 
     it("falls back to legacy sections when defaults are explicitly configured", async () => {

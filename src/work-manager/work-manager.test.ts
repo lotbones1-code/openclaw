@@ -8,9 +8,11 @@ import {
   buildWorkManagerSnapshot,
   buildMissedWorkLedger,
   buildOpenClawMissionContract,
+  applyQueuedWorkDispatchProof,
   evaluateWorkAdmission,
   evaluateLivenessHandoff,
   selectQueuedWorkForDispatch,
+  validateQueueDrainDispatchProof,
   selectMissionRevenueFloorCronJob,
   rankWorkCandidates,
   summarizeWorkManagerStatus,
@@ -598,6 +600,135 @@ describe("work manager", () => {
     expect(selectQueuedWorkForDispatch(snapshot)).toMatchObject({
       decision: "dispatch",
       candidate: { workId: "runnable-revenue" },
+    });
+  });
+
+  it("prefers productive company work over queued status digest work", () => {
+    const snapshot = buildWorkManagerSnapshot({
+      nowMs: now,
+      tasks: [],
+      taskFlows: [
+        flow({
+          flowId: "status-digest",
+          goal: "Shamil shift status digest — every 5m",
+          stateJson: {
+            openclawWorkManager: {
+              version: 1,
+              workId: "status-digest-work",
+              lane: "Shamil shift status digest — every 5m",
+              pool: "conversation",
+              priority: "P1",
+              requestedResources: [],
+              expectedOutput: "STATUS DIGEST for Shamil. ≤60 words. NO menus.",
+              proofPath: "/tmp/status.md",
+              timeoutMs: 300_000,
+              workStatus: "queued",
+              createdAt: now - 2_000,
+            },
+          },
+        }),
+        flow({
+          flowId: "research-revenue",
+          goal: "Target sourcing revenue recovery",
+          stateJson: {
+            openclawWorkManager: {
+              version: 1,
+              workId: "research-revenue-work",
+              lane: "Target sourcing revenue recovery",
+              pool: "revenue",
+              priority: "P1",
+              requestedResources: ["vault:PROJECT_STATE"],
+              expectedOutput: "Source 10 safe Titan targets and write proof.",
+              proofPath: "/tmp/research.md",
+              timeoutMs: 300_000,
+              workStatus: "queued",
+              createdAt: now - 1_000,
+            },
+          },
+        }),
+      ],
+      cronJobs: [],
+      reliability: reliability("green"),
+      mode: "admission",
+    });
+
+    expect(selectQueuedWorkForDispatch(snapshot)).toMatchObject({
+      decision: "dispatch",
+      candidate: { workId: "research-revenue-work" },
+    });
+  });
+
+  it("does not validate queueDrain dispatch without native start proof", () => {
+    const snapshot = buildWorkManagerSnapshot({
+      nowMs: now,
+      tasks: [],
+      taskFlows: [
+        flow({
+          flowId: "runnable-revenue",
+          stateJson: {
+            openclawWorkManager: {
+              version: 1,
+              pool: "revenue",
+              priority: "P1",
+              requestedResources: [],
+              proofPath: "/tmp/runnable.md",
+              timeoutMs: 300_000,
+              workStatus: "queued",
+            },
+          },
+        }),
+      ],
+      cronJobs: [],
+      reliability: reliability("green"),
+      mode: "admission",
+    });
+
+    expect(validateQueueDrainDispatchProof(snapshot.queueDrain)).toEqual({
+      valid: false,
+      reason: "dispatch_proof_missing",
+    });
+  });
+
+  it("records dispatch proof for a promoted native cron job", () => {
+    const snapshot = buildWorkManagerSnapshot({
+      nowMs: now,
+      tasks: [],
+      taskFlows: [
+        flow({
+          flowId: "runnable-revenue",
+          stateJson: {
+            openclawWorkManager: {
+              version: 1,
+              pool: "revenue",
+              priority: "P1",
+              requestedResources: [],
+              proofPath: "/tmp/runnable.md",
+              timeoutMs: 300_000,
+              workStatus: "queued",
+            },
+          },
+        }),
+      ],
+      cronJobs: [],
+      reliability: reliability("green"),
+      mode: "admission",
+    });
+
+    const proofed = applyQueuedWorkDispatchProof(snapshot.queueDrain, {
+      dispatchEffect: "cron_promoted",
+      cronJobId: "cron-revenue",
+      owner: "cron",
+      startedAt: now,
+      firstStatusCheck: now + 60_000,
+    });
+
+    expect(validateQueueDrainDispatchProof(proofed)).toEqual({ valid: true });
+    expect(proofed).toMatchObject({
+      decision: "dispatch",
+      dispatchEffect: "cron_promoted",
+      workId: "runnable-revenue",
+      cronJobId: "cron-revenue",
+      proofPath: "/tmp/runnable.md",
     });
   });
 

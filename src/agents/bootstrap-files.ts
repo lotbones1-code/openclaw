@@ -14,7 +14,11 @@ import {
   resolveBootstrapTotalMaxChars,
 } from "./pi-embedded-helpers.js";
 import {
+  DEFAULT_AGENTS_FILENAME,
+  DEFAULT_CLAUDE_FILENAME,
   DEFAULT_HEARTBEAT_FILENAME,
+  DEFAULT_IDENTITY_FILENAME,
+  DEFAULT_SOUL_FILENAME,
   filterBootstrapFilesForSession,
   isWorkspaceBootstrapPending,
   loadWorkspaceBootstrapFiles,
@@ -30,6 +34,37 @@ export const FULL_BOOTSTRAP_COMPLETED_CUSTOM_TYPE = "openclaw:bootstrap-context:
 const BOOTSTRAP_WARNING_DEDUPE_LIMIT = 1024;
 const seenBootstrapWarnings = new Set<string>();
 const bootstrapWarningOrder: string[] = [];
+const CRITICAL_AUTHORITY_REQUIRED_SECTIONS = [
+  "Authority Order",
+  "Native Only",
+  "Stop And Interrupt",
+  "Proof And Reporting",
+  "Selected Option Fidelity",
+  "Typed Gates",
+  "Safe Work Continues",
+  "Learning OS",
+  "Self-Builder Discipline",
+] as const;
+const CRITICAL_AUTHORITY_SECTION_ALIASES: Record<
+  (typeof CRITICAL_AUTHORITY_REQUIRED_SECTIONS)[number],
+  string[]
+> = {
+  "Authority Order": ["Authority Order"],
+  "Native Only": ["Native Only"],
+  "Stop And Interrupt": ["Stop And Interrupt"],
+  "Proof And Reporting": ["Proof And Reporting"],
+  "Selected Option Fidelity": ["Selected Option Fidelity", "Execution Kernel"],
+  "Typed Gates": ["Typed Gates", "Execution Kernel"],
+  "Safe Work Continues": ["Safe Work Continues", "Always-On Directive Drain"],
+  "Learning OS": ["Learning OS", "Learning And Success Notes"],
+  "Self-Builder Discipline": ["Self-Builder Discipline", "Self-Builder Contract"],
+};
+const CRITICAL_AUTHORITY_FILE_NAMES = new Set([
+  DEFAULT_AGENTS_FILENAME,
+  DEFAULT_IDENTITY_FILENAME,
+  DEFAULT_CLAUDE_FILENAME,
+  DEFAULT_SOUL_FILENAME,
+]);
 
 function rememberBootstrapWarning(key: string): boolean {
   if (seenBootstrapWarnings.has(key)) {
@@ -233,21 +268,78 @@ function isExecutionKernelEnabled(config?: OpenClawConfig): boolean {
   return candidate?.executionKernel?.enabled === true;
 }
 
+function isContextAuthorityEnabled(config?: OpenClawConfig): boolean {
+  const candidate = config as
+    | (OpenClawConfig & {
+        executionKernel?: { contextAuthority?: { enabled?: boolean } };
+      })
+    | undefined;
+  return candidate?.executionKernel?.contextAuthority?.enabled === true;
+}
+
+function normalizeHeading(value: string): string {
+  return value.trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+function extractMarkdownHeadings(content: string): Set<string> {
+  const headings = new Set<string>();
+  let inCodeBlock = false;
+  for (const line of content.split("\n")) {
+    if (line.trimStart().startsWith("```")) {
+      inCodeBlock = !inCodeBlock;
+      continue;
+    }
+    if (inCodeBlock) {
+      continue;
+    }
+    const match = line.match(/^#{2,3}\s+(.+?)\s*$/);
+    if (match?.[1]) {
+      headings.add(normalizeHeading(match[1]));
+    }
+  }
+  return headings;
+}
+
+function resolveMissingCriticalAuthoritySections(files: WorkspaceBootstrapFile[]): string[] {
+  const agents = files.find((file) => file.name === DEFAULT_AGENTS_FILENAME && !file.missing);
+  if (!agents?.content) {
+    return [...CRITICAL_AUTHORITY_REQUIRED_SECTIONS];
+  }
+  const headings = extractMarkdownHeadings(agents.content);
+  return CRITICAL_AUTHORITY_REQUIRED_SECTIONS.filter((section) => {
+    const aliases = CRITICAL_AUTHORITY_SECTION_ALIASES[section] ?? [section];
+    return !aliases.some((alias) => headings.has(normalizeHeading(alias)));
+  });
+}
+
 function assertCriticalBootstrapAuthorityFits(params: {
   files: WorkspaceBootstrapFile[];
   config?: OpenClawConfig;
 }): void {
-  if (!isExecutionKernelEnabled(params.config)) {
+  if (!isExecutionKernelEnabled(params.config) && !isContextAuthorityEnabled(params.config)) {
     return;
   }
   const maxChars = resolveBootstrapMaxChars(params.config);
-  const criticalNames = new Set(["AGENTS.md", "IDENTITY.md"]);
   const offenders = params.files
-    .filter((file) => criticalNames.has(file.name) && !file.missing)
+    .filter((file) => CRITICAL_AUTHORITY_FILE_NAMES.has(file.name) && !file.missing)
     .filter((file) => (file.content ?? "").length > maxChars)
     .map((file) => `${file.name}:${(file.content ?? "").length}/${maxChars}`);
-  if (offenders.length === 0) {
+  const missingSections = isContextAuthorityEnabled(params.config)
+    ? resolveMissingCriticalAuthoritySections(params.files)
+    : [];
+  if (offenders.length === 0 && missingSections.length === 0) {
     return;
+  }
+  if (isContextAuthorityEnabled(params.config)) {
+    const details = [
+      offenders.length > 0 ? `over budget: ${offenders.join(", ")}` : "",
+      missingSections.length > 0 ? `missing critical sections: ${missingSections.join(", ")}` : "",
+    ]
+      .filter(Boolean)
+      .join("; ");
+    throw new Error(
+      `BOOTSTRAP_CRITICAL_AUTHORITY_INVALID: critical bootstrap authority would be incomplete (${details}). Compact or split authority before injection.`,
+    );
   }
   throw new Error(
     `BOOTSTRAP_CRITICAL_TRUNCATED: critical bootstrap authority exceeds bootstrapMaxChars (${offenders.join(", ")}). Compact or split authority before injection.`,

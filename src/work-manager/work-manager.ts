@@ -19,6 +19,8 @@ import {
   type MissionValidationResult,
   type OpenClawMissionContract,
   type WorkAdmissionDecision,
+  type WorkDispatchEffect,
+  type WorkDispatchProof,
   type WorkLivenessHandoffDecision,
   type WorkManagerCandidate,
   type WorkManagerMode,
@@ -35,6 +37,8 @@ export type {
   MissionRevenueFloorDecision,
   MissedWorkLedgerRow,
   WorkAdmissionDecision,
+  WorkDispatchEffect,
+  WorkDispatchProof,
   WorkLivenessHandoffDecision,
   MissionValidationResult,
   OpenClawMissionContract,
@@ -164,7 +168,18 @@ export function buildWorkManagerSnapshot(
     candidates,
   };
 
-  snapshot.queueDrain = selectQueuedWorkForDispatch(snapshot);
+  const selectedQueueDrain = selectQueuedWorkForDispatch(snapshot);
+  snapshot.queueDrain =
+    input.dispatchProofEnabled &&
+    selectedQueueDrain.decision === "dispatch" &&
+    validateQueueDrainDispatchProof(selectedQueueDrain).valid === false
+      ? {
+          decision: "blocked",
+          reason: "DISPATCH_PROOF_MISSING",
+          candidate: selectedQueueDrain.candidate,
+          nextDispatchCheckAt: nowMs + 60_000,
+        }
+      : selectedQueueDrain;
   return snapshot;
 }
 
@@ -347,7 +362,9 @@ export function selectMissionRevenueFloorCronJob(params: {
 }
 
 export function selectQueuedWorkForDispatch(snapshot: WorkManagerSnapshot) {
-  const candidates = rankWorkCandidates(snapshot.queuedP0P1Work);
+  const ranked = rankWorkCandidates(snapshot.queuedP0P1Work);
+  const productive = ranked.filter((candidate) => !isReadOnlySensorOrStatusCandidate(candidate));
+  const candidates = productive.length > 0 ? productive : ranked;
   if (candidates.length === 0) {
     return { decision: "none" as const, reason: "no_queued_p0_p1" as const };
   }
@@ -373,6 +390,54 @@ export function selectQueuedWorkForDispatch(snapshot: WorkManagerSnapshot) {
     blockedResources: blocked.admission.blockedResources,
     nextDispatchCheckAt: blocked.candidate.leaseUntil,
   };
+}
+
+export function applyQueuedWorkDispatchProof(
+  decision: WorkManagerSnapshot["queueDrain"],
+  proof: Omit<WorkDispatchProof, "workId" | "proofPath" | "expectedOutput"> & {
+    workId?: string;
+    proofPath?: string;
+    expectedOutput?: string;
+  },
+): WorkManagerSnapshot["queueDrain"] {
+  if (decision.decision !== "dispatch") {
+    return decision;
+  }
+  return {
+    ...decision,
+    dispatchEffect: proof.dispatchEffect,
+    workId: proof.workId ?? decision.candidate.workId,
+    ...(proof.taskId !== undefined ? { taskId: proof.taskId } : {}),
+    ...(proof.cronJobId !== undefined ? { cronJobId: proof.cronJobId } : {}),
+    ...(proof.flowId !== undefined ? { flowId: proof.flowId } : {}),
+    owner: proof.owner,
+    startedAt: proof.startedAt,
+    proofPath: proof.proofPath ?? decision.candidate.proofPath,
+    expectedOutput: proof.expectedOutput ?? decision.candidate.expectedOutput,
+    firstStatusCheck: proof.firstStatusCheck,
+  };
+}
+
+export function validateQueueDrainDispatchProof(
+  decision: WorkManagerSnapshot["queueDrain"],
+): { valid: true } | { valid: false; reason: "dispatch_proof_missing" } {
+  if (decision.decision !== "dispatch") {
+    return { valid: true };
+  }
+  if (
+    decision.dispatchEffect &&
+    decision.workId &&
+    decision.owner &&
+    typeof decision.startedAt === "number" &&
+    decision.proofPath &&
+    decision.expectedOutput &&
+    typeof decision.firstStatusCheck === "number" &&
+    (decision.dispatchEffect === "exact_gate" ||
+      Boolean(decision.taskId || decision.cronJobId || decision.flowId))
+  ) {
+    return { valid: true };
+  }
+  return { valid: false, reason: "dispatch_proof_missing" };
 }
 
 export function evaluateLivenessHandoff(params: {

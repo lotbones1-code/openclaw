@@ -95,14 +95,33 @@ export type MissionValidationResult = {
   missing: string[];
 };
 
+export type WorkDispatchEffect =
+  | "task_started"
+  | "cron_promoted"
+  | "taskflow_started"
+  | "exact_gate";
+
+export type WorkDispatchProof = {
+  dispatchEffect: WorkDispatchEffect;
+  workId: string;
+  taskId?: string;
+  cronJobId?: string;
+  flowId?: string;
+  owner: string;
+  startedAt: number;
+  proofPath: string;
+  expectedOutput: string;
+  firstStatusCheck: number;
+};
+
 export type WorkQueueDrainDecision =
   | { decision: "none"; reason: "no_queued_p0_p1" }
-  | {
+  | ({
       decision: "dispatch";
       reason: "available";
       candidate: WorkManagerCandidate;
       nextDispatchCheckAt?: number;
-    }
+    } & Partial<WorkDispatchProof>)
   | {
       decision: "blocked";
       reason: string;
@@ -181,6 +200,7 @@ export type WorkManagerSnapshot = {
 export type BuildWorkManagerSnapshotInput = {
   nowMs?: number;
   mode?: WorkManagerMode;
+  dispatchProofEnabled?: boolean;
   tasks?: TaskRecord[];
   taskControls?: TaskControlRecord[];
   taskFlows?: TaskFlowRecord[];

@@ -5,6 +5,7 @@ import {
   TYPED_GATE_CODES,
   type AuthoritySource,
   type OpenClawDirectiveContract,
+  type OpenClawCapabilityStatusRecord,
   type PreActionCandidate,
   type ProofCounters,
   type TypedGateCode,
@@ -19,6 +20,7 @@ export type {
   AuthoritySource,
   DirectiveCapsule,
   LearningFooter,
+  OpenClawCapabilityStatusRecord,
   OpenClawDirectiveContract,
   PreActionCandidate,
   ProofCounters,
@@ -143,6 +145,56 @@ export function validateOpenClawDirectiveContract(value: unknown): {
     missing.push("owner_direct_approval");
   }
   return { valid: missing.length === 0, missing };
+}
+
+export function buildCapabilityStatusRecord(params: {
+  capabilityId: string;
+  service: string;
+  status: OpenClawCapabilityStatusRecord["status"];
+  proofPath: string;
+  lastVerifiedAt: string;
+  hardGates: string[];
+  firstUseStatus?: OpenClawCapabilityStatusRecord["firstUseStatus"];
+}): OpenClawCapabilityStatusRecord {
+  const hardGates = params.hardGates.filter((gate): gate is TypedGateCode =>
+    TYPED_GATE_CODE_SET.has(gate),
+  );
+  return {
+    capabilityId: params.capabilityId,
+    service: params.service,
+    status: params.status,
+    firstUseStatus: params.firstUseStatus ?? "not_used",
+    proofPath: params.proofPath,
+    lastVerifiedAt: params.lastVerifiedAt,
+    hardGates,
+  };
+}
+
+export function markCapabilityUsed(
+  record: OpenClawCapabilityStatusRecord,
+  params: { proofPath: string; usedAt: string },
+): OpenClawCapabilityStatusRecord {
+  return {
+    ...record,
+    status: record.status === "unavailable" ? "connected" : record.status,
+    firstUseStatus: "used",
+    proofPath: params.proofPath,
+    lastVerifiedAt: params.usedAt,
+  };
+}
+
+export function markCapabilityFirstUseExactGate(
+  record: OpenClawCapabilityStatusRecord,
+  params: { gate: TypedGateCode; proofPath: string; gatedAt: string },
+): OpenClawCapabilityStatusRecord {
+  return {
+    ...record,
+    status: "gated",
+    firstUseStatus: "exact_gate",
+    proofPath: params.proofPath,
+    lastVerifiedAt: params.gatedAt,
+    hardGates: Array.from(new Set([...record.hardGates, params.gate])),
+  };
 }
 
 export function validateDirectiveCapsule(value: unknown): {

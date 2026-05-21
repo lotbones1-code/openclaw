@@ -814,6 +814,8 @@ describe("config help copy quality", () => {
     expect(/default:\s*3/i.test(recentTurnsPreserve)).toBe(true);
 
     const postCompactionSections = FIELD_HELP["agents.defaults.compaction.postCompactionSections"];
+    expect(/Authority Order|Native Only/i.test(postCompactionSections)).toBe(true);
+    expect(/Stop And Interrupt|Proof And Reporting/i.test(postCompactionSections)).toBe(true);
     expect(/Session Startup|Red Lines/i.test(postCompactionSections)).toBe(true);
     expect(/Every Session|Safety/i.test(postCompactionSections)).toBe(true);
     expect(/\[\]|disable/i.test(postCompactionSections)).toBe(true);

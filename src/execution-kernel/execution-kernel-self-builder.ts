@@ -57,7 +57,7 @@ export function validateSelfBuilderCloseout(params: {
     missing.push("learningFooter.next_action");
   }
   const blockedSurfaces = (params.addedNonNativeSurfaces ?? []).filter((surface) =>
-    /wrapper|host_cron|launchagent|daemon|fake_browser|provider_shortcut|parallel_db/i.test(
+    /wrapper|host_cron|launchagent|daemon|fake_browser|provider_shortcut|parallel_db|openclawd/i.test(
       surface,
     ),
   );

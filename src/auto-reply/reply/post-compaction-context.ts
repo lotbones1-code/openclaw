@@ -8,8 +8,19 @@ import { openBoundaryFile } from "../../infra/boundary-file-read.js";
 import { normalizeLowercaseStringOrEmpty } from "../../shared/string-coerce.js";
 
 const MAX_CONTEXT_CHARS = 1800;
-const DEFAULT_POST_COMPACTION_SECTIONS = ["Session Startup", "Red Lines"];
+const DEFAULT_POST_COMPACTION_SECTIONS = [
+  "Authority Order",
+  "Native Only",
+  "Execution Kernel",
+  "Always-On Directive Drain",
+  "Stop And Interrupt",
+  "Proof And Reporting",
+  "Account, Payment, Browser, And Personal Assistant Work",
+  "Self-Builder Contract",
+  "Learning And Success Notes",
+];
 const LEGACY_POST_COMPACTION_SECTIONS = ["Every Session", "Safety"];
+const LEGACY_SESSION_STARTUP_SECTIONS = ["Session Startup", "Red Lines"];
 
 // Compare configured section names as a case-insensitive set so deployments can
 // pin the documented defaults in any order without changing fallback semantics.
@@ -68,6 +79,15 @@ export type PostCompactionContextOptions = {
   nowMs?: number;
 };
 
+function isContextAuthorityEnabled(config?: OpenClawConfig): boolean {
+  const candidate = config as
+    | (OpenClawConfig & {
+        executionKernel?: { contextAuthority?: { enabled?: boolean } };
+      })
+    | undefined;
+  return candidate?.executionKernel?.contextAuthority?.enabled === true;
+}
+
 export async function readPostCompactionContext(
   workspaceDir: string,
   options?: PostCompactionContextOptions,
@@ -116,8 +136,14 @@ export async function readPostCompactionContext(
     const isDefaultSections =
       !Array.isArray(configuredSections) ||
       matchesSectionSet(configuredSections, DEFAULT_POST_COMPACTION_SECTIONS);
-    if (sections.length === 0 && isDefaultSections) {
-      sections = extractSections(content, LEGACY_POST_COMPACTION_SECTIONS, foundSectionNames);
+    const isLegacySessionStartupSections =
+      Array.isArray(configuredSections) &&
+      matchesSectionSet(configuredSections, LEGACY_SESSION_STARTUP_SECTIONS);
+    if (sections.length === 0 && (isDefaultSections || isLegacySessionStartupSections)) {
+      sections = extractSections(content, LEGACY_SESSION_STARTUP_SECTIONS, foundSectionNames);
+      if (sections.length === 0) {
+        sections = extractSections(content, LEGACY_POST_COMPACTION_SECTIONS, foundSectionNames);
+      }
     }
 
     if (sections.length === 0) {
@@ -137,6 +163,11 @@ export async function readPostCompactionContext(
     const { timeLine } = resolveCronStyleNow(cfg ?? {}, resolvedNowMs);
 
     const combined = sections.join("\n\n").replaceAll("YYYY-MM-DD", dateStamp);
+    if (isContextAuthorityEnabled(cfg) && combined.length > maxContextChars) {
+      throw new Error(
+        `BOOTSTRAP_CRITICAL_AUTHORITY_INVALID: post-compaction critical authority exceeds postCompactionMaxChars (${combined.length}/${maxContextChars}). Compact or split authority before injection.`,
+      );
+    }
     const safeContent =
       combined.length > maxContextChars
         ? combined.slice(0, maxContextChars) + "\n...[truncated]..."
@@ -146,7 +177,8 @@ export async function readPostCompactionContext(
     // "Session Startup" sequence explicitly. When custom sections are configured,
     // use generic prose — referencing a hardcoded "Session Startup" sequence
     // would be misleading for deployments that use different section names.
-    const prose = isDefaultSections
+    const useLegacySessionStartupProse = isLegacySessionStartupSections;
+    const prose = useLegacySessionStartupProse
       ? "Session was just compacted. The conversation summary above is a hint, NOT a substitute for your startup sequence. " +
         "Run your Session Startup sequence - read the required files before responding to the user."
       : `Session was just compacted. The conversation summary above is a hint, NOT a substitute for your full startup sequence. ` +
@@ -161,7 +193,10 @@ export async function readPostCompactionContext(
       `${prose}\n\n` +
       `${sectionLabel}\n\n${safeContent}\n\n${timeLine}`
     );
-  } catch {
+  } catch (error) {
+    if (error instanceof Error && error.message.includes("BOOTSTRAP_CRITICAL_AUTHORITY_INVALID")) {
+      throw error;
+    }
     return null;
   }
 }

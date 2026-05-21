@@ -308,17 +308,6 @@ export async function modelsStatusCommand(
       return hasAny;
     });
   const providerAuthMap = new Map(providerAuth.map((entry) => [entry.provider, entry]));
-  const primaryAuthProof = resolvePrimaryAuthProof({
-    provider: resolved.provider,
-    providerAuth: providerAuthMap.get(normalizeProviderId(resolved.provider)),
-  });
-  const primaryClaudeRoute = validateClaudeCliPrimaryRoute({
-    strictCliOnly: cfg.executionKernel?.enabled === true,
-    primaryModelRef: resolvedLabel,
-    actualBackend: resolved.provider,
-    authProfileProvider: primaryAuthProof.authProfileProvider,
-    authProfileMode: primaryAuthProof.authProfileMode,
-  });
   const missingProvidersInUse = Array.from(providersInUse)
     .filter((provider) => !providerAuthMap.has(provider))
     .filter((provider) => !syntheticAuthByProvider.has(provider))
@@ -419,6 +408,18 @@ export async function modelsStatusCommand(
   const oauthProfiles = authHealth.profiles.filter(
     (profile) => profile.type === "oauth" || profile.type === "token",
   );
+  const primaryAuthProof = resolvePrimaryAuthProof({
+    provider: resolved.provider,
+    providerAuth: providerAuthMap.get(normalizeProviderId(resolved.provider)),
+    oauthProfiles,
+  });
+  const primaryClaudeRoute = validateClaudeCliPrimaryRoute({
+    strictCliOnly: cfg.executionKernel?.enabled === true,
+    primaryModelRef: resolvedLabel,
+    actualBackend: resolved.provider,
+    authProfileProvider: primaryAuthProof.authProfileProvider,
+    authProfileMode: primaryAuthProof.authProfileMode,
+  });
 
   const unusableProfiles = (() => {
     const now = Date.now();
@@ -481,8 +482,11 @@ export async function modelsStatusCommand(
           defaultModel: defaultLabel,
           resolvedDefault: resolvedLabel,
           actualBackend: resolved.provider,
+          authProfileId: primaryAuthProof.authProfileId,
           authProfileProvider: primaryAuthProof.authProfileProvider,
           authProfileMode: primaryAuthProof.authProfileMode,
+          authProfileStatus: primaryAuthProof.authProfileStatus,
+          authProfileExpiresAt: primaryAuthProof.authProfileExpiresAt,
         },
       },
       imageModel: imageModel || null,
@@ -860,18 +864,53 @@ function resolvePrimaryAuthProof(params: {
         };
       }
     | undefined;
-}): { authProfileProvider?: string; authProfileMode?: string } {
+  oauthProfiles: Array<{
+    profileId: string;
+    provider: string;
+    status: string;
+    expiresAt?: number;
+    type?: string;
+  }>;
+}): {
+  authProfileId?: string;
+  authProfileProvider?: string;
+  authProfileMode?: string;
+  authProfileStatus?: string;
+  authProfileExpiresAt?: number;
+} {
   const labels = params.providerAuth?.profiles.labels ?? [];
   const claudeCliOauth = labels.find((label) => /:claude-cli=oauth/i.test(label));
+  const normalizedProvider = normalizeProviderId(params.provider);
+  const matchingProfile = params.oauthProfiles.find((profile) => {
+    const profileId = profile.profileId.toLowerCase();
+    if (claudeCliOauth && profileId.includes("claude-cli")) {
+      return true;
+    }
+    return normalizeProviderId(profile.provider) === normalizedProvider;
+  });
   if (claudeCliOauth) {
-    return { authProfileProvider: "claude-cli", authProfileMode: "oauth" };
+    return {
+      authProfileId: matchingProfile?.profileId,
+      authProfileProvider: "claude-cli",
+      authProfileMode: "oauth",
+      authProfileStatus: matchingProfile?.status,
+      authProfileExpiresAt: matchingProfile?.expiresAt,
+    };
   }
   const oauth = labels.find((label) => /=oauth/i.test(label));
   if (oauth) {
     return {
+      authProfileId: matchingProfile?.profileId,
       authProfileProvider: params.providerAuth?.provider ?? params.provider,
       authProfileMode: "oauth",
+      authProfileStatus: matchingProfile?.status,
+      authProfileExpiresAt: matchingProfile?.expiresAt,
     };
   }
-  return { authProfileProvider: params.providerAuth?.provider ?? params.provider };
+  return {
+    authProfileId: matchingProfile?.profileId,
+    authProfileProvider: params.providerAuth?.provider ?? params.provider,
+    authProfileStatus: matchingProfile?.status,
+    authProfileExpiresAt: matchingProfile?.expiresAt,
+  };
 }

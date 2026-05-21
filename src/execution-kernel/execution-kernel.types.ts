@@ -147,3 +147,16 @@ export type LearningFooter = {
   learning_event: string;
   next_action: string;
 };
+
+export type CapabilityStatus = "unavailable" | "connected" | "usable" | "gated" | "degraded";
+export type CapabilityFirstUseStatus = "not_used" | "used" | "exact_gate";
+
+export type OpenClawCapabilityStatusRecord = {
+  capabilityId: string;
+  service: string;
+  status: CapabilityStatus;
+  firstUseStatus: CapabilityFirstUseStatus;
+  proofPath: string;
+  lastVerifiedAt: string;
+  hardGates: TypedGateCode[];
+};

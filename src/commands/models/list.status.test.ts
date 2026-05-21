@@ -161,6 +161,7 @@ vi.mock("../../agents/auth-health.js", () => ({
         provider: profile.provider,
         type: profile.type ?? "api_key",
         status: profile.type === "api_key" ? "static" : "ok",
+        expiresAt: typeof profile.expires === "number" ? profile.expires : undefined,
         source: "store",
         label: profileId,
       }));
@@ -290,6 +291,17 @@ describe("modelsStatusCommand auth overview", () => {
     expect(mocks.resolveOpenClawAgentDir).toHaveBeenCalled();
     expect(mocks.ensureAuthProfileStore).toHaveBeenCalled();
     expect(payload.defaultModel).toBe("anthropic/claude-opus-4-6");
+    expect(payload.executionKernel.primaryClaudeRoute).toMatchObject({
+      defaultModel: "anthropic/claude-opus-4-6",
+      resolvedDefault: "anthropic/claude-opus-4-6",
+      actualBackend: "anthropic",
+      authProfileProvider: "anthropic",
+      authProfileMode: "oauth",
+    });
+    expect(payload.executionKernel.primaryClaudeRoute.authProfileStatus).toBe("ok");
+    expect(payload.executionKernel.primaryClaudeRoute.authProfileExpiresAt).toBeGreaterThan(
+      Date.now(),
+    );
     expect(payload.configPath).toBe("/tmp/openclaw-dev/openclaw.json");
     expect(payload.auth.storePath).toBe("/tmp/openclaw-agent/auth-profiles.json");
     expect(payload.auth.shellEnvFallback.enabled).toBe(true);

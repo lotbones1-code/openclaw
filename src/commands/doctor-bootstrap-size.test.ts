@@ -74,4 +74,18 @@ describe("noteBootstrapFileSize", () => {
     await noteBootstrapFileSize({} as OpenClawConfig);
     expect(note).not.toHaveBeenCalled();
   });
+
+  it("surfaces exact critical authority gate from bootstrap validation", async () => {
+    resolveBootstrapContextForRun.mockRejectedValue(
+      new Error(
+        "BOOTSTRAP_CRITICAL_AUTHORITY_INVALID: AGENTS.md missing critical sections: Stop And Interrupt",
+      ),
+    );
+
+    await expect(
+      noteBootstrapFileSize({
+        executionKernel: { contextAuthority: { enabled: true } },
+      } as never),
+    ).rejects.toThrow(/BOOTSTRAP_CRITICAL_AUTHORITY_INVALID/);
+  });
 });

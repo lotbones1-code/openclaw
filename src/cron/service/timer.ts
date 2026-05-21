@@ -25,6 +25,7 @@ import {
 import type { TaskRecord } from "../../tasks/task-registry.types.js";
 import {
   buildWorkManagerSnapshot,
+  applyQueuedWorkDispatchProof,
   createCronWorkCandidate,
   evaluateWorkAdmission,
   selectMissionRevenueFloorCronJob,
@@ -1086,6 +1087,7 @@ export async function onTimer(state: CronServiceState) {
       const reconciledRunningMarkers = reconcileRunningMarkers(state, dueCheckNow);
       const quarantinedStoredTimeoutLoops = quarantineStoredRecurringTimeoutLoops(state);
       const promotedMissionRevenueFloor = promoteMissionRevenueFloorJob(state, dueCheckNow);
+      const appliedQueuedDispatchProof = applyAlwaysOnQueuedDispatchProof(state, dueCheckNow);
       const due = collectRunnableJobs(state, dueCheckNow);
       const admitted = filterRunnableJobsByWorkAdmission(state, due, dueCheckNow);
       const admissionDeferred = admitted.length !== due.length;
@@ -1102,6 +1104,7 @@ export async function onTimer(state: CronServiceState) {
           reconciledRunningMarkers ||
           quarantinedStoredTimeoutLoops ||
           promotedMissionRevenueFloor ||
+          appliedQueuedDispatchProof ||
           changed ||
           admissionDeferred
         ) {
@@ -1402,6 +1405,190 @@ function promoteMissionRevenueFloorJob(state: CronServiceState, nowMs: number): 
   return true;
 }
 
+function applyAlwaysOnQueuedDispatchProof(state: CronServiceState, nowMs: number): boolean {
+  if (!state.store) {
+    return false;
+  }
+  const snapshot = buildWorkManagerSnapshot({
+    nowMs,
+    mode: "admission",
+    tasks: listTaskRecords(),
+    taskControls: listTaskControlRecords({ activeOnly: true }),
+    taskFlows: listTaskFlowRecords(),
+    cronJobs: state.store.jobs,
+    reliability: getLatestReliabilityHealthSnapshot(),
+  });
+  const decision = snapshot.queueDrain;
+  if (decision.decision !== "dispatch") {
+    return false;
+  }
+
+  const parsedCronRun = parseQueueDrainCronWorkId(decision.candidate.workId);
+  if (parsedCronRun) {
+    const job = state.store.jobs.find((entry) => entry.id === parsedCronRun.jobId);
+    if (job && isJobEnabled(job) && typeof job.state.runningAtMs !== "number") {
+      job.state.nextRunAtMs = nowMs;
+      job.updatedAtMs = nowMs;
+      upsertQueueDrainDispatchFlow({
+        candidate: decision.candidate,
+        dispatchEffect: "cron_promoted",
+        cronJobId: job.id,
+        nowMs,
+        reason: "always_on_directive_drain",
+      });
+      state.deps.log.info(
+        { jobId: job.id, workId: decision.candidate.workId },
+        "cron: always-on directive drain promoted native cron job",
+      );
+      recordReliabilityEvent({
+        subsystem: "cron",
+        code: "queue_drain_cron_promoted",
+        severity: "info",
+        subject: job.id,
+        message: `cron: always-on directive drain promoted ${job.name}`,
+        recoverable: true,
+        quiet: true,
+        createdAt: nowMs,
+        metadata: {
+          jobId: job.id,
+          workId: decision.candidate.workId,
+        },
+      });
+      return true;
+    }
+  }
+
+  const flow = listTaskFlowRecords()
+    .filter((record) => ["queued", "blocked", "waiting"].includes(record.status))
+    .find((record) => {
+      const metadata = readObject(record.stateJson, "openclawWorkManager");
+      return metadata.workId === decision.candidate.workId;
+    });
+  if (!flow) {
+    return false;
+  }
+  const dispatchProof = applyQueuedWorkDispatchProof(decision, {
+    dispatchEffect: "taskflow_started",
+    flowId: flow.flowId,
+    owner: decision.candidate.owner,
+    startedAt: nowMs,
+    firstStatusCheck: nowMs + 60_000,
+  });
+  const stateJson = mergeStateJson(flow.stateJson, {
+    openclawWorkManager: {
+      ...readObject(flow.stateJson, "openclawWorkManager"),
+      workStatus: "running",
+      dispatchedAt: nowMs,
+      leaseUntil: nowMs + DEFAULT_JOB_TIMEOUT_MS,
+    },
+    openclawQueueDrain: {
+      ...dispatchProof,
+      reason: "always_on_directive_drain",
+      dispatchedAt: nowMs,
+    },
+  });
+  updateFlowRecordByIdExpectedRevision({
+    flowId: flow.flowId,
+    expectedRevision: flow.revision,
+    patch: {
+      status: "running",
+      currentStep: "dispatched_by_work_manager",
+      stateJson,
+      updatedAt: nowMs,
+      endedAt: null,
+    },
+  });
+  state.deps.log.info(
+    { flowId: flow.flowId, workId: decision.candidate.workId },
+    "cron: always-on directive drain started native TaskFlow work",
+  );
+  recordReliabilityEvent({
+    subsystem: "cron",
+    code: "queue_drain_taskflow_started",
+    severity: "info",
+    subject: flow.flowId,
+    message: `cron: always-on directive drain started TaskFlow ${flow.flowId}`,
+    recoverable: true,
+    quiet: true,
+    createdAt: nowMs,
+    metadata: {
+      flowId: flow.flowId,
+      workId: decision.candidate.workId,
+    },
+  });
+  return true;
+}
+
+function parseQueueDrainCronWorkId(workId: string): { jobId: string; startedAtMs: number } | null {
+  if (!workId.startsWith("cron:")) {
+    return null;
+  }
+  const lastColon = workId.lastIndexOf(":");
+  if (lastColon <= "cron:".length) {
+    return null;
+  }
+  const startedAtMs = Number(workId.slice(lastColon + 1));
+  if (!Number.isFinite(startedAtMs)) {
+    return null;
+  }
+  return { jobId: workId.slice("cron:".length, lastColon), startedAtMs };
+}
+
+function upsertQueueDrainDispatchFlow(params: {
+  candidate: WorkManagerCandidate;
+  dispatchEffect: "cron_promoted";
+  cronJobId: string;
+  nowMs: number;
+  reason: string;
+}) {
+  const ownerKey = `work-manager:queue-drain:${params.candidate.workId}`;
+  const dispatchProof = applyQueuedWorkDispatchProof(
+    { decision: "dispatch", reason: "available", candidate: params.candidate },
+    {
+      dispatchEffect: params.dispatchEffect,
+      cronJobId: params.cronJobId,
+      owner: params.candidate.owner,
+      startedAt: params.nowMs,
+      firstStatusCheck: params.nowMs + 60_000,
+    },
+  );
+  createManagedTaskFlow({
+    controllerId: WORK_MANAGER_CONTROLLER_ID,
+    ownerKey,
+    notifyPolicy: "silent",
+    status: "succeeded",
+    goal: `Queue drain dispatched ${params.candidate.lane}`,
+    currentStep: "queue_drain_dispatched",
+    stateJson: {
+      openclawWorkManager: {
+        version: 1,
+        workId: params.candidate.workId,
+        lane: params.candidate.lane,
+        pool: params.candidate.pool,
+        priority: params.candidate.priority,
+        requestedResources: params.candidate.requestedResources,
+        expectedOutput: params.candidate.expectedOutput,
+        proofPath: params.candidate.proofPath,
+        timeoutMs: params.candidate.timeoutMs,
+        owner: params.candidate.owner,
+        workStatus: "succeeded",
+        createdAt: params.nowMs,
+        leaseUntil: params.nowMs,
+        handoffDepth: params.candidate.handoffDepth ?? 0,
+      },
+      openclawQueueDrain: {
+        ...dispatchProof,
+        reason: params.reason,
+        dispatchedAt: params.nowMs,
+      },
+      openclawLastRecoveryAction: `queue_drain:${params.dispatchEffect}:${params.cronJobId}`,
+    },
+    createdAt: params.nowMs,
+    updatedAt: params.nowMs,
+    endedAt: params.nowMs,
+  });
+}
+
 function filterRunnableJobsByWorkAdmission(
   state: CronServiceState,
   due: CronJob[],
@@ -1501,6 +1688,16 @@ function upsertMissionRevenueFloorWorkFlow(params: {
     missionId: params.missionId,
     jobId: params.job.id,
   });
+  const dispatchProof = applyQueuedWorkDispatchProof(
+    { decision: "dispatch", reason: "available", candidate: params.candidate },
+    {
+      dispatchEffect: "cron_promoted",
+      cronJobId: params.job.id,
+      owner: params.candidate.owner,
+      startedAt: params.nowMs,
+      firstStatusCheck: params.nowMs + 60_000,
+    },
+  );
   const stateJson = {
     openclawWorkManager: {
       version: 1,
@@ -1519,7 +1716,7 @@ function upsertMissionRevenueFloorWorkFlow(params: {
       handoffDepth: params.candidate.handoffDepth ?? 0,
     },
     openclawQueueDrain: {
-      decision: "dispatch",
+      ...dispatchProof,
       reason: "mission_revenue_floor",
       dispatchedAt: params.nowMs,
     },
@@ -1618,6 +1815,16 @@ function finishAdmissionDeferredWorkFlow(
   if (!existing || !["queued", "running", "waiting", "blocked"].includes(existing.status)) {
     return;
   }
+  const dispatchProof = applyQueuedWorkDispatchProof(
+    { decision: "dispatch", reason: "available", candidate },
+    {
+      dispatchEffect: "cron_promoted",
+      cronJobId: job.id,
+      owner: candidate.owner,
+      startedAt: nowMs,
+      firstStatusCheck: nowMs + 60_000,
+    },
+  );
   const stateJson = mergeStateJson(existing.stateJson, {
     openclawWorkManager: {
       ...readObject(existing.stateJson, "openclawWorkManager"),
@@ -1625,8 +1832,7 @@ function finishAdmissionDeferredWorkFlow(
       dispatchedAt: nowMs,
     },
     openclawQueueDrain: {
-      decision: "dispatch",
-      reason: "available",
+      ...dispatchProof,
       dispatchedAt: nowMs,
     },
   });

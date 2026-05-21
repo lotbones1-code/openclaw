@@ -1,7 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
   buildCompactSuccessPatternNote,
+  buildCapabilityStatusRecord,
   buildOpenClawDirectiveContract,
+  markCapabilityFirstUseExactGate,
+  markCapabilityUsed,
   resolveAuthorityPrecedence,
   splitVagueWorkerObjective,
   validateDirectiveCapsule,
@@ -230,6 +233,30 @@ describe("execution kernel worker closeout", () => {
       missing: expect.arrayContaining(["regressionTest_or_exactTestGate"]),
       blockedSurfaces: ["wrapper_script"],
     });
+
+    expect(
+      validateSelfBuilderCloseout({
+        directiveId: "directive-self-builder",
+        defectFixed: "old cron referenced non-native openclawd env",
+        sourceAuthority: "native compliance",
+        nativeSourceChange: true,
+        regressionTest: "native compliance old openclawd cron residue",
+        testsPassed: true,
+        stagedSecretJunkScan: true,
+        commitHash: "abc1234",
+        reportPath: "/tmp/self-builder.md",
+        rollbackOrDisablePath: "native openclaw cron disable <job>",
+        learningFooter: {
+          lessons_applied: ["none_relevant"],
+          learning_event: "recorded",
+          next_action: "completed",
+        },
+        addedNonNativeSurfaces: ["openclawd_env_cron_reference"],
+      }),
+    ).toMatchObject({
+      valid: false,
+      blockedSurfaces: ["openclawd_env_cron_reference"],
+    });
   });
 
   it("writes compact non-secret success pattern notes", () => {
@@ -250,5 +277,50 @@ describe("execution kernel worker closeout", () => {
     expect(JSON.stringify(note)).not.toContain("redacted-example-value");
     expect(JSON.stringify(note)).not.toContain("000");
     expect(note.omitted_secret_fields).toEqual(["privateField", "billingField"]);
+  });
+});
+
+describe("execution kernel capability status", () => {
+  it("does not count a connected tool as used before first-use proof", () => {
+    const connected = buildCapabilityStatusRecord({
+      capabilityId: "higgsfield:titan",
+      service: "Higgsfield",
+      status: "connected",
+      proofPath: "/tmp/higgsfield-connected.md",
+      lastVerifiedAt: "2026-05-21T10:00:00.000Z",
+      hardGates: [],
+    });
+
+    expect(connected.firstUseStatus).toBe("not_used");
+    expect(connected.status).toBe("connected");
+
+    const used = markCapabilityUsed(connected, {
+      proofPath: "/tmp/higgsfield-first-use.md",
+      usedAt: "2026-05-21T10:05:00.000Z",
+    });
+
+    expect(used.firstUseStatus).toBe("used");
+    expect(used.proofPath).toBe("/tmp/higgsfield-first-use.md");
+  });
+
+  it("records exact typed gate for gated capability first use", () => {
+    const connected = buildCapabilityStatusRecord({
+      capabilityId: "higgsfield:titan",
+      service: "Higgsfield",
+      status: "connected",
+      proofPath: "/tmp/higgsfield-connected.md",
+      lastVerifiedAt: "2026-05-21T10:00:00.000Z",
+      hardGates: [],
+    });
+
+    const gated = markCapabilityFirstUseExactGate(connected, {
+      gate: "INSUFFICIENT_CREDITS",
+      proofPath: "/tmp/higgsfield-gated.md",
+      gatedAt: "2026-05-21T10:05:00.000Z",
+    });
+
+    expect(gated.status).toBe("gated");
+    expect(gated.firstUseStatus).toBe("exact_gate");
+    expect(gated.hardGates).toContain("INSUFFICIENT_CREDITS");
   });
 });

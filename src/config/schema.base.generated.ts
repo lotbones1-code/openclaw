@@ -5000,7 +5000,7 @@ export const GENERATED_BASE_CONFIG_SCHEMA: BaseConfigSchemaResponse = {
                     },
                     title: "Post-Compaction Context Sections",
                     description:
-                      'AGENTS.md H2/H3 section names re-injected after compaction so the agent reruns critical startup guidance. Leave unset to use "Session Startup"/"Red Lines" with legacy fallback to "Every Session"/"Safety"; set to [] to disable reinjection entirely.',
+                      'AGENTS.md H2/H3 section names re-injected after compaction so the agent reruns critical startup guidance. Leave unset to use compact authority sections such as "Authority Order", "Native Only", "Stop And Interrupt", and "Proof And Reporting" with legacy fallback to "Session Startup"/"Red Lines" and then "Every Session"/"Safety"; set to [] to disable reinjection entirely.',
                   },
                   model: {
                     type: "string",
@@ -23476,6 +23476,46 @@ export const GENERATED_BASE_CONFIG_SCHEMA: BaseConfigSchemaResponse = {
         description:
           "Global MCP server definitions managed by OpenClaw. Embedded Pi and other runtime adapters can consume these servers without storing them inside Pi-owned project settings.",
       },
+      executionKernel: {
+        type: "object",
+        properties: {
+          enabled: {
+            type: "boolean",
+          },
+          contextAuthority: {
+            type: "object",
+            properties: {
+              enabled: {
+                type: "boolean",
+              },
+            },
+            additionalProperties: false,
+          },
+          dispatchProof: {
+            type: "object",
+            properties: {
+              enabled: {
+                type: "boolean",
+              },
+            },
+            additionalProperties: false,
+          },
+          capabilityAwareness: {
+            type: "object",
+            properties: {
+              enabled: {
+                type: "boolean",
+              },
+              mode: {
+                type: "string",
+                enum: ["shadow", "active"],
+              },
+            },
+            additionalProperties: false,
+          },
+        },
+        additionalProperties: false,
+      },
       skills: {
         type: "object",
         properties: {
@@ -27093,7 +27133,7 @@ export const GENERATED_BASE_CONFIG_SCHEMA: BaseConfigSchemaResponse = {
     },
     "agents.defaults.compaction.postCompactionSections": {
       label: "Post-Compaction Context Sections",
-      help: 'AGENTS.md H2/H3 section names re-injected after compaction so the agent reruns critical startup guidance. Leave unset to use "Session Startup"/"Red Lines" with legacy fallback to "Every Session"/"Safety"; set to [] to disable reinjection entirely.',
+      help: 'AGENTS.md H2/H3 section names re-injected after compaction so the agent reruns critical startup guidance. Leave unset to use compact authority sections such as "Authority Order", "Native Only", "Stop And Interrupt", and "Proof And Reporting" with legacy fallback to "Session Startup"/"Red Lines" and then "Every Session"/"Safety"; set to [] to disable reinjection entirely.',
       tags: ["advanced"],
     },
     "agents.defaults.compaction.timeoutSeconds": {

@@ -18,6 +18,25 @@ import {
 } from "./bootstrap-files.js";
 import type { WorkspaceBootstrapFile } from "./workspace.js";
 
+function compactRootAuthority(overrides: { omit?: string } = {}) {
+  const sections = [
+    "Authority Order",
+    "Native Only",
+    "Stop And Interrupt",
+    "Proof And Reporting",
+    "Selected Option Fidelity",
+    "Typed Gates",
+    "Safe Work Continues",
+    "Learning OS",
+    "Self-Builder Discipline",
+  ].filter((section) => section !== overrides.omit);
+  return [
+    "# AGENTS.md - OpenClaw Root Contract",
+    "",
+    ...sections.map((section) => `## ${section}\n\n${section} rules.`),
+  ].join("\n\n");
+}
+
 function registerExtraBootstrapFileHook() {
   registerInternalHook("agent:bootstrap", (event) => {
     const context = event.context as AgentBootstrapHookContext;
@@ -188,6 +207,45 @@ describe("resolveBootstrapContextForRun", () => {
         } as never,
       }),
     ).rejects.toThrow(/BOOTSTRAP_CRITICAL_TRUNCATED/);
+  });
+
+  it("fails instead of silently truncating critical authority when context authority is enabled", async () => {
+    const workspaceDir = await makeTempWorkspace("openclaw-bootstrap-context-authority-");
+    await fs.writeFile(path.join(workspaceDir, "AGENTS.md"), compactRootAuthority(), "utf8");
+    await fs.writeFile(
+      path.join(workspaceDir, "CLAUDE.md"),
+      "critical claude authority\n".repeat(80),
+      "utf8",
+    );
+
+    await expect(
+      resolveBootstrapContextForRun({
+        workspaceDir,
+        config: {
+          executionKernel: { contextAuthority: { enabled: true } },
+          agents: { defaults: { bootstrapMaxChars: 100 } },
+        } as never,
+      }),
+    ).rejects.toThrow(/BOOTSTRAP_CRITICAL_AUTHORITY_INVALID/);
+  });
+
+  it("fails when compact root authority loses a required critical section", async () => {
+    const workspaceDir = await makeTempWorkspace("openclaw-bootstrap-missing-section-");
+    await fs.writeFile(
+      path.join(workspaceDir, "AGENTS.md"),
+      compactRootAuthority({ omit: "Stop And Interrupt" }),
+      "utf8",
+    );
+
+    await expect(
+      resolveBootstrapContextForRun({
+        workspaceDir,
+        config: {
+          executionKernel: { contextAuthority: { enabled: true } },
+          agents: { defaults: { bootstrapMaxChars: 20_000 } },
+        } as never,
+      }),
+    ).rejects.toThrow(/BOOTSTRAP_CRITICAL_AUTHORITY_INVALID.*Stop And Interrupt/);
   });
 
   it("uses heartbeat-only bootstrap files in lightweight heartbeat mode", async () => {

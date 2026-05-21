@@ -139,6 +139,19 @@ export type OpenClawConfig = {
   executionKernel?: {
     /** Native V1 directive/typed-gate/stop/proof enforcement switch. */
     enabled?: boolean;
+    /** Scoped authority validation that fails instead of silently truncating critical startup rules. */
+    contextAuthority?: {
+      enabled?: boolean;
+    };
+    /** Scoped queue-drain proof enforcement for Work Manager dispatch decisions. */
+    dispatchProof?: {
+      enabled?: boolean;
+    };
+    /** Minimal capability status surface; V1 defaults to shadow/status mode. */
+    capabilityAwareness?: {
+      enabled?: boolean;
+      mode?: "shadow" | "active";
+    };
   };
   /** Network-level SSRF protection via an operator-managed forward proxy. */
   proxy?: ProxyConfig;

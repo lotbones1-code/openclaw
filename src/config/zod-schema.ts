@@ -971,6 +971,25 @@ export const OpenClawSchema = z
     executionKernel: z
       .object({
         enabled: z.boolean().optional(),
+        contextAuthority: z
+          .object({
+            enabled: z.boolean().optional(),
+          })
+          .strict()
+          .optional(),
+        dispatchProof: z
+          .object({
+            enabled: z.boolean().optional(),
+          })
+          .strict()
+          .optional(),
+        capabilityAwareness: z
+          .object({
+            enabled: z.boolean().optional(),
+            mode: z.enum(["shadow", "active"]).optional(),
+          })
+          .strict()
+          .optional(),
       })
       .strict()
       .optional(),

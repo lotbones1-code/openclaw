@@ -142,6 +142,7 @@ async function collectWorkManagerSnapshot(mode: WorkManagerMode) {
 
   return buildWorkManagerSnapshot({
     mode,
+    dispatchProofEnabled: cfg.executionKernel?.dispatchProof?.enabled === true,
     tasks: listTaskRecords(),
     taskControls: listTaskControlRecords({ activeOnly: true }),
     taskFlows: listTaskFlowRecords(),

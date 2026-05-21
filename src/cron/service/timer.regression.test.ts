@@ -1641,6 +1641,69 @@ describe("cron service timer regressions", () => {
     ).toBe(true);
   });
 
+  it("starts queued P0/P1 TaskFlow work with dispatch proof outside overnight mode", async () => {
+    resetTaskFlowRegistryForTests();
+    const store = timerRegressionFixtures.makeStorePath();
+    const now = Date.parse("2026-02-15T12:45:00.000Z");
+    await writeCronJobs(store.storePath, []);
+    const queued = createManagedTaskFlow({
+      controllerId: "work-manager",
+      ownerKey: "work-manager:timeout-split:target-sourcing",
+      notifyPolicy: "silent",
+      status: "queued",
+      goal: "Target sourcing revenue recovery",
+      currentStep: "timeout_auto_split_queued",
+      stateJson: {
+        openclawWorkManager: {
+          version: 1,
+          workId: "target-sourcing-work",
+          lane: "Target sourcing revenue recovery",
+          pool: "revenue",
+          priority: "P1",
+          requestedResources: ["vault:PROJECT_STATE"],
+          expectedOutput: "Source 10 safe Titan targets and write proof.",
+          proofPath: "/tmp/target-sourcing.md",
+          timeoutMs: 300_000,
+          owner: "work-manager:timeout-split",
+          workStatus: "queued",
+          createdAt: now - 60_000,
+          leaseUntil: now + 60_000,
+        },
+      },
+      createdAt: now - 60_000,
+      updatedAt: now - 60_000,
+    });
+    const state = createCronServiceState({
+      cronEnabled: true,
+      storePath: store.storePath,
+      log: noopLogger,
+      nowMs: () => now,
+      enqueueSystemEvent: vi.fn(),
+      requestHeartbeatNow: vi.fn(),
+      runIsolatedAgentJob: vi.fn(async () => ({ status: "ok" as const, summary: "unused" })),
+    });
+
+    await onTimer(state);
+
+    const dispatched = listTaskFlowRecords().find((flow) => flow.flowId === queued.flowId);
+    expect(dispatched).toMatchObject({
+      status: "running",
+      currentStep: "dispatched_by_work_manager",
+    });
+    expect(dispatched?.stateJson).toMatchObject({
+      openclawWorkManager: {
+        workStatus: "running",
+      },
+      openclawQueueDrain: {
+        decision: "dispatch",
+        dispatchEffect: "taskflow_started",
+        flowId: queued.flowId,
+        workId: "target-sourcing-work",
+        proofPath: "/tmp/target-sourcing.md",
+      },
+    });
+  });
+
   it("queues a narrowed native timeout recovery after repeated cron timeouts", async () => {
     resetTaskFlowRegistryForTests();
     const store = timerRegressionFixtures.makeStorePath();
