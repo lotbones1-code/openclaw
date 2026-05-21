@@ -990,6 +990,15 @@ export const OpenClawSchema = z
           })
           .strict()
           .optional(),
+        missionRuntime: z
+          .object({
+            enabled: z.boolean().optional(),
+            mode: z.enum(["shadow", "active"]).optional(),
+            standingCompanyDirective: z.boolean().optional(),
+            suppressLaneAutonomy: z.boolean().optional(),
+          })
+          .strict()
+          .optional(),
       })
       .strict()
       .optional(),

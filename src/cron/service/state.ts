@@ -1,4 +1,5 @@
 import type { CronConfig } from "../../config/types.cron.js";
+import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import type { HeartbeatRunResult, HeartbeatWakeRequest } from "../../infra/heartbeat-wake.js";
 import type {
   CronDeliveryStatus,
@@ -44,6 +45,8 @@ export type CronServiceDeps = {
   cronEnabled: boolean;
   /** CronConfig for session retention settings. */
   cronConfig?: CronConfig;
+  /** Execution Kernel scoped runtime switches used by native cron/work orchestration. */
+  executionKernel?: OpenClawConfig["executionKernel"];
   /** Default agent id for jobs without an agent id. */
   defaultAgentId?: string;
   /** Resolve session store path for a given agent id. */

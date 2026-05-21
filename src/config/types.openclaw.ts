@@ -152,6 +152,13 @@ export type OpenClawConfig = {
       enabled?: boolean;
       mode?: "shadow" | "active";
     };
+    /** Mission-owned company brain. Cron wakes it; capabilities execute only what it selects. */
+    missionRuntime?: {
+      enabled?: boolean;
+      mode?: "shadow" | "active";
+      standingCompanyDirective?: boolean;
+      suppressLaneAutonomy?: boolean;
+    };
   };
   /** Network-level SSRF protection via an operator-managed forward proxy. */
   proxy?: ProxyConfig;

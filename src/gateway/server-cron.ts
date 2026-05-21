@@ -166,6 +166,7 @@ export function buildGatewayCronService(params: {
     storePath,
     cronEnabled,
     cronConfig: params.cfg.cron,
+    executionKernel: params.cfg.executionKernel,
     defaultAgentId,
     resolveSessionStorePath,
     sessionStorePath,

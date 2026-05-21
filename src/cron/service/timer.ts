@@ -2,6 +2,10 @@ import { resolveFailoverReasonFromError } from "../../agents/failover-error.js";
 import type { CronConfig, CronRetryOn } from "../../config/types.cron.js";
 import type { HeartbeatRunResult } from "../../infra/heartbeat-wake.js";
 import {
+  isMissionRuntimeAutonomousCronJob,
+  selectMissionRuntimeUnit,
+} from "../../mission-runtime/mission-runtime.js";
+import {
   getLatestReliabilityHealthSnapshot,
   recordReliabilityEvent,
 } from "../../reliability/supervisor.js";
@@ -84,6 +88,7 @@ const RECURRING_TIMEOUT_QUARANTINE_AFTER = 3;
 const RUNNING_MARKER_TIMEOUT_RECONCILE_GRACE_MS = 2_000;
 const RUNNING_MARKER_RUN_ID_DRIFT_MS = 5_000;
 const WORK_MANAGER_CONTROLLER_ID = "work-manager";
+const MISSION_RUNTIME_CONTROLLER_ID = "mission-runtime";
 const WORK_MANAGER_ADMISSION_RETRY_MS = 60_000;
 const WORK_MANAGER_TIMEOUT_SPLIT_AFTER = 2;
 
@@ -1086,9 +1091,16 @@ export async function onTimer(state: CronServiceState) {
       const dueCheckNow = state.deps.nowMs();
       const reconciledRunningMarkers = reconcileRunningMarkers(state, dueCheckNow);
       const quarantinedStoredTimeoutLoops = quarantineStoredRecurringTimeoutLoops(state);
-      const promotedMissionRevenueFloor = promoteMissionRevenueFloorJob(state, dueCheckNow);
-      const appliedQueuedDispatchProof = applyAlwaysOnQueuedDispatchProof(state, dueCheckNow);
-      const due = collectRunnableJobs(state, dueCheckNow);
+      const missionRuntimeTick = applyMissionRuntimeTick(state, dueCheckNow);
+      const promotedMissionRevenueFloor = missionRuntimeTick.enabled
+        ? false
+        : promoteMissionRevenueFloorJob(state, dueCheckNow);
+      const appliedQueuedDispatchProof = missionRuntimeTick.enabled
+        ? false
+        : applyAlwaysOnQueuedDispatchProof(state, dueCheckNow);
+      const due = collectRunnableJobs(state, dueCheckNow, {
+        skipJobIds: missionRuntimeTick.skipJobIds,
+      });
       const admitted = filterRunnableJobsByWorkAdmission(state, due, dueCheckNow);
       const admissionDeferred = admitted.length !== due.length;
 
@@ -1103,6 +1115,7 @@ export async function onTimer(state: CronServiceState) {
         if (
           reconciledRunningMarkers ||
           quarantinedStoredTimeoutLoops ||
+          missionRuntimeTick.changed ||
           promotedMissionRevenueFloor ||
           appliedQueuedDispatchProof ||
           changed ||
@@ -1347,6 +1360,129 @@ function collectRunnableJobs(
       allowCronMissedRunByLastRun: opts?.allowCronMissedRunByLastRun,
     }),
   );
+}
+
+function applyMissionRuntimeTick(
+  state: CronServiceState,
+  nowMs: number,
+): { enabled: boolean; changed: boolean; skipJobIds: ReadonlySet<string> } {
+  if (!state.store || state.deps.executionKernel?.missionRuntime?.enabled !== true) {
+    return { enabled: false, changed: false, skipJobIds: new Set<string>() };
+  }
+
+  const mode = state.deps.executionKernel.missionRuntime.mode ?? "shadow";
+  const standingCompanyDirective =
+    state.deps.executionKernel.missionRuntime.standingCompanyDirective !== false;
+  const suppressLaneAutonomy =
+    state.deps.executionKernel.missionRuntime.suppressLaneAutonomy !== false;
+  const snapshot = buildWorkManagerSnapshot({
+    nowMs,
+    mode: "admission",
+    tasks: listTaskRecords(),
+    taskControls: listTaskControlRecords({ activeOnly: true }),
+    taskFlows: listTaskFlowRecords(),
+    cronJobs: state.store.jobs,
+    reliability: getLatestReliabilityHealthSnapshot(),
+  });
+  const queuedCandidates =
+    snapshot.queueDrain.decision === "dispatch" ? [snapshot.queueDrain.candidate] : [];
+  const decision = selectMissionRuntimeUnit({
+    nowMs,
+    snapshot,
+    cronJobs: state.store.jobs,
+    queuedCandidates,
+    standingCompanyDirective,
+  });
+
+  const skipJobIds =
+    mode === "active" && suppressLaneAutonomy
+      ? new Set(decision.suppressedCronJobIds)
+      : new Set<string>();
+  let changed = upsertMissionRuntimeDecisionFlow({ decision, nowMs, mode });
+  if (mode !== "active") {
+    return { enabled: true, changed, skipJobIds: new Set<string>() };
+  }
+
+  if (suppressLaneAutonomy) {
+    changed =
+      suppressAutonomousLaneCronJobs({
+        state,
+        nowMs,
+        skipJobIds,
+        selectedJobId: decision.decision === "promote_cron" ? decision.cronJobId : undefined,
+      }) || changed;
+  }
+
+  if (decision.decision === "promote_cron") {
+    const job = state.store.jobs.find((entry) => entry.id === decision.cronJobId);
+    if (job && isJobEnabled(job) && typeof job.state.runningAtMs !== "number") {
+      job.state.nextRunAtMs = nowMs;
+      job.updatedAtMs = nowMs;
+      changed = true;
+      upsertMissionRuntimeDispatchFlow({
+        job,
+        candidate: decision.candidate,
+        missionId: decision.mission?.mission_id ?? "standing_company_directive",
+        nowMs,
+      });
+      state.deps.log.info(
+        { jobId: job.id, missionId: decision.mission?.mission_id },
+        "cron: mission runtime promoted selected native capability",
+      );
+      recordReliabilityEvent({
+        subsystem: "cron",
+        code: "mission_runtime_cron_promoted",
+        severity: "info",
+        subject: job.id,
+        message: `cron: mission runtime promoted ${job.name}`,
+        recoverable: true,
+        quiet: true,
+        createdAt: nowMs,
+        metadata: {
+          jobId: job.id,
+          missionId: decision.mission?.mission_id,
+          suppressedCronJobIds: decision.suppressedCronJobIds,
+        },
+      });
+    }
+  } else if (decision.decision === "start_taskflow") {
+    changed =
+      startMissionRuntimeTaskFlow({
+        candidate: decision.candidate,
+        missionId: decision.mission?.mission_id ?? "standing_company_directive",
+        nowMs,
+      }) || changed;
+  }
+
+  return { enabled: true, changed, skipJobIds };
+}
+
+function suppressAutonomousLaneCronJobs(params: {
+  state: CronServiceState;
+  nowMs: number;
+  skipJobIds: ReadonlySet<string>;
+  selectedJobId?: string;
+}): boolean {
+  if (!params.state.store || params.skipJobIds.size === 0) {
+    return false;
+  }
+  let changed = false;
+  for (const job of params.state.store.jobs) {
+    if (!params.skipJobIds.has(job.id) || job.id === params.selectedJobId) {
+      continue;
+    }
+    if (!isMissionRuntimeAutonomousCronJob(job)) {
+      continue;
+    }
+    const nextRunAtMs = params.nowMs + WORK_MANAGER_ADMISSION_RETRY_MS;
+    if (job.state.nextRunAtMs !== nextRunAtMs) {
+      job.state.nextRunAtMs = nextRunAtMs;
+      job.updatedAtMs = params.nowMs;
+      changed = true;
+    }
+    upsertMissionRuntimeSuppressedFlow({ job, nowMs: params.nowMs, nextRunAtMs });
+  }
+  return changed;
 }
 
 function promoteMissionRevenueFloorJob(state: CronServiceState, nowMs: number): boolean {
@@ -1745,6 +1881,281 @@ function upsertMissionRevenueFloorWorkFlow(params: {
     createdAt: params.nowMs,
     updatedAt: params.nowMs,
     endedAt: params.nowMs,
+  });
+}
+
+function upsertMissionRuntimeDecisionFlow(params: {
+  decision: ReturnType<typeof selectMissionRuntimeUnit>;
+  nowMs: number;
+  mode: "shadow" | "active";
+}): boolean {
+  const ownerKey = "mission-runtime:decision:current";
+  const runtimeState: Record<string, JsonValue> = {
+    version: 1,
+    mode: params.mode,
+    decision: params.decision.decision,
+    reason: params.decision.reason,
+    suppressedCronJobIds: params.decision.suppressedCronJobIds,
+    exactGates: params.decision.exactGates,
+    nextCheckAt: params.decision.nextCheckAt,
+    decidedAt: params.nowMs,
+  };
+  if (params.decision.decision === "promote_cron") {
+    runtimeState.selectedCronJobId = params.decision.cronJobId;
+  }
+  if (params.decision.decision === "start_taskflow") {
+    runtimeState.selectedWorkId = params.decision.workId;
+  }
+  const stateJson: Record<string, JsonValue> = {
+    openclawMissionRuntime: runtimeState,
+  };
+  if (params.decision.mission) {
+    stateJson.openclawMission = params.decision.mission as unknown as JsonValue;
+  }
+  const existing = findLatestTaskFlowForOwnerKey(ownerKey);
+  if (existing && ["queued", "running", "waiting", "blocked"].includes(existing.status)) {
+    updateFlowRecordByIdExpectedRevision({
+      flowId: existing.flowId,
+      expectedRevision: existing.revision,
+      patch: {
+        status: "running",
+        currentStep: "mission_runtime_decided",
+        stateJson,
+        updatedAt: params.nowMs,
+        endedAt: null,
+      },
+    });
+    return true;
+  }
+  createManagedTaskFlow({
+    controllerId: MISSION_RUNTIME_CONTROLLER_ID,
+    ownerKey,
+    notifyPolicy: "silent",
+    status: "running",
+    goal: "Mission Runtime owns the next safe company unit",
+    currentStep: "mission_runtime_decided",
+    stateJson,
+    createdAt: params.nowMs,
+    updatedAt: params.nowMs,
+    endedAt: null,
+  });
+  return true;
+}
+
+function upsertMissionRuntimeDispatchFlow(params: {
+  job: CronJob;
+  candidate: WorkManagerCandidate;
+  missionId: string;
+  nowMs: number;
+}) {
+  const ownerKey = `mission-runtime:dispatch:${params.missionId}:${params.job.id}`;
+  const dispatchProof = applyQueuedWorkDispatchProof(
+    { decision: "dispatch", reason: "available", candidate: params.candidate },
+    {
+      dispatchEffect: "cron_promoted",
+      cronJobId: params.job.id,
+      owner: params.candidate.owner,
+      startedAt: params.nowMs,
+      firstStatusCheck: params.nowMs + 60_000,
+    },
+  );
+  const stateJson = {
+    openclawWorkManager: {
+      version: 1,
+      workId: params.candidate.workId,
+      lane: params.candidate.lane,
+      pool: params.candidate.pool,
+      priority: params.candidate.priority,
+      requestedResources: params.candidate.requestedResources,
+      expectedOutput: params.candidate.expectedOutput,
+      proofPath: params.candidate.proofPath,
+      timeoutMs: params.candidate.timeoutMs,
+      owner: params.candidate.owner,
+      workStatus: "succeeded",
+      createdAt: params.nowMs,
+      leaseUntil: params.nowMs,
+      handoffDepth: params.candidate.handoffDepth ?? 0,
+    },
+    openclawQueueDrain: {
+      ...dispatchProof,
+      reason: "mission_runtime_selected",
+      dispatchedAt: params.nowMs,
+    },
+    openclawMissionRuntime: {
+      version: 1,
+      missionId: params.missionId,
+      decision: "promote_cron",
+      selectedCronJobId: params.job.id,
+      proofPath: params.candidate.proofPath,
+      expectedOutput: params.candidate.expectedOutput,
+    },
+    openclawLastRecoveryAction: `mission_runtime:promoted:${params.job.id}`,
+  } satisfies Record<string, JsonValue>;
+  const existing = findLatestTaskFlowForOwnerKey(ownerKey);
+  if (existing && ["queued", "running", "waiting", "blocked"].includes(existing.status)) {
+    finishFlow({
+      flowId: existing.flowId,
+      expectedRevision: existing.revision,
+      currentStep: "mission_runtime_promoted",
+      stateJson,
+      updatedAt: params.nowMs,
+      endedAt: params.nowMs,
+    });
+    return;
+  }
+  createManagedTaskFlow({
+    controllerId: MISSION_RUNTIME_CONTROLLER_ID,
+    ownerKey,
+    notifyPolicy: "silent",
+    status: "succeeded",
+    goal: `Mission Runtime promoted ${params.job.name}`,
+    currentStep: "mission_runtime_promoted",
+    stateJson,
+    createdAt: params.nowMs,
+    updatedAt: params.nowMs,
+    endedAt: params.nowMs,
+  });
+}
+
+function startMissionRuntimeTaskFlow(params: {
+  candidate: WorkManagerCandidate;
+  missionId: string;
+  nowMs: number;
+}): boolean {
+  const flow = listTaskFlowRecords()
+    .filter((record) => ["queued", "blocked", "waiting"].includes(record.status))
+    .find((record) => {
+      const metadata = readObject(record.stateJson, "openclawWorkManager");
+      return metadata.workId === params.candidate.workId;
+    });
+  if (!flow) {
+    upsertMissionRuntimeExactGateFlow({
+      candidate: params.candidate,
+      missionId: params.missionId,
+      nowMs: params.nowMs,
+      gate: "DISPATCH_PROOF_MISSING",
+    });
+    return true;
+  }
+  const dispatchProof = applyQueuedWorkDispatchProof(
+    { decision: "dispatch", reason: "available", candidate: params.candidate },
+    {
+      dispatchEffect: "taskflow_started",
+      flowId: flow.flowId,
+      owner: params.candidate.owner,
+      startedAt: params.nowMs,
+      firstStatusCheck: params.nowMs + 60_000,
+    },
+  );
+  const stateJson = mergeStateJson(flow.stateJson, {
+    openclawWorkManager: {
+      ...readObject(flow.stateJson, "openclawWorkManager"),
+      workStatus: "running",
+      dispatchedAt: params.nowMs,
+      leaseUntil: params.nowMs + DEFAULT_JOB_TIMEOUT_MS,
+    },
+    openclawQueueDrain: {
+      ...dispatchProof,
+      reason: "mission_runtime_selected",
+      dispatchedAt: params.nowMs,
+    },
+    openclawMissionRuntime: {
+      version: 1,
+      missionId: params.missionId,
+      decision: "start_taskflow",
+      selectedWorkId: params.candidate.workId,
+      proofPath: params.candidate.proofPath,
+      expectedOutput: params.candidate.expectedOutput,
+    },
+  });
+  updateFlowRecordByIdExpectedRevision({
+    flowId: flow.flowId,
+    expectedRevision: flow.revision,
+    patch: {
+      status: "running",
+      currentStep: "dispatched_by_mission_runtime",
+      stateJson,
+      updatedAt: params.nowMs,
+      endedAt: null,
+    },
+  });
+  return true;
+}
+
+function upsertMissionRuntimeSuppressedFlow(params: {
+  job: CronJob;
+  nowMs: number;
+  nextRunAtMs: number;
+}) {
+  const ownerKey = `mission-runtime:suppressed:${params.job.id}`;
+  const stateJson = {
+    openclawMissionRuntime: {
+      version: 1,
+      decision: "suppressed_autonomous_lane",
+      jobId: params.job.id,
+      jobName: params.job.name,
+      reason: "mission_runtime_owns_company_work",
+      nextRunAtMs: params.nextRunAtMs,
+      decidedAt: params.nowMs,
+    },
+  } satisfies Record<string, JsonValue>;
+  const existing = findLatestTaskFlowForOwnerKey(ownerKey);
+  if (existing && ["queued", "running", "waiting", "blocked"].includes(existing.status)) {
+    updateFlowRecordByIdExpectedRevision({
+      flowId: existing.flowId,
+      expectedRevision: existing.revision,
+      patch: {
+        status: "blocked",
+        currentStep: "mission_runtime_suppressed_autonomy",
+        stateJson,
+        updatedAt: params.nowMs,
+        endedAt: null,
+      },
+    });
+    return;
+  }
+  createManagedTaskFlow({
+    controllerId: MISSION_RUNTIME_CONTROLLER_ID,
+    ownerKey,
+    notifyPolicy: "silent",
+    status: "blocked",
+    goal: `Mission Runtime suppresses autonomous lane ${params.job.name}`,
+    currentStep: "mission_runtime_suppressed_autonomy",
+    stateJson,
+    createdAt: params.nowMs,
+    updatedAt: params.nowMs,
+    endedAt: null,
+  });
+}
+
+function upsertMissionRuntimeExactGateFlow(params: {
+  candidate: WorkManagerCandidate;
+  missionId: string;
+  nowMs: number;
+  gate: string;
+}) {
+  createManagedTaskFlow({
+    controllerId: MISSION_RUNTIME_CONTROLLER_ID,
+    ownerKey: `mission-runtime:exact-gate:${params.missionId}:${params.candidate.workId}`,
+    notifyPolicy: "silent",
+    status: "blocked",
+    goal: `Mission Runtime exact gate for ${params.candidate.lane}`,
+    currentStep: "mission_runtime_exact_gate",
+    stateJson: {
+      openclawMissionRuntime: {
+        version: 1,
+        missionId: params.missionId,
+        decision: "exact_gate",
+        gate: params.gate,
+        workId: params.candidate.workId,
+        proofPath: params.candidate.proofPath,
+        expectedOutput: params.candidate.expectedOutput,
+        decidedAt: params.nowMs,
+      },
+    },
+    createdAt: params.nowMs,
+    updatedAt: params.nowMs,
+    endedAt: null,
   });
 }
 

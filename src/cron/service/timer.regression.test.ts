@@ -133,6 +133,79 @@ describe("cron service timer regressions", () => {
     timeoutSpy.mockRestore();
   });
 
+  it("mission runtime active mode promotes one company unit and suppresses other autonomous lanes", async () => {
+    const store = timerRegressionFixtures.makeStorePath();
+    const nowMs = Date.parse("2026-05-21T12:00:00.000Z");
+    const target = {
+      ...createDueIsolatedJob({
+        id: "target-enrichment",
+        nowMs,
+        nextRunAtMs: nowMs,
+      }),
+      name: "Target Enrichment + CRO",
+      payload: { kind: "agentTurn", message: "Find buyer targets and CRO proof" },
+    } as CronJob;
+    const content = {
+      ...createDueIsolatedJob({
+        id: "content-factory",
+        nowMs,
+        nextRunAtMs: nowMs,
+      }),
+      name: "Content Factory",
+      payload: { kind: "agentTurn", message: "Create content packet" },
+    } as CronJob;
+    const wallet = {
+      ...createDueIsolatedJob({
+        id: "wallet-watcher",
+        nowMs,
+        nextRunAtMs: nowMs,
+      }),
+      name: "Titan Wallet Watcher",
+      payload: { kind: "agentTurn", message: "Read wallet status" },
+    } as CronJob;
+    const runIsolatedAgentJob = createDefaultIsolatedRunner();
+    const state = createCronServiceState({
+      cronEnabled: true,
+      storePath: store.storePath,
+      log: noopLogger,
+      nowMs: () => nowMs,
+      executionKernel: {
+        missionRuntime: {
+          enabled: true,
+          mode: "active",
+          standingCompanyDirective: true,
+          suppressLaneAutonomy: true,
+        },
+      },
+      enqueueSystemEvent: vi.fn(),
+      requestHeartbeatNow: vi.fn(),
+      runIsolatedAgentJob,
+    });
+
+    state.store = { version: 1, jobs: [target, content, wallet] };
+    await fs.writeFile(store.storePath, JSON.stringify(state.store), "utf8");
+
+    await onTimer(state);
+
+    expect(runIsolatedAgentJob).toHaveBeenCalledTimes(2);
+    const calledJobIds = vi.mocked(runIsolatedAgentJob).mock.calls.map(([params]) => params.job.id);
+    expect(calledJobIds).toContain("target-enrichment");
+    expect(calledJobIds).toContain("wallet-watcher");
+    expect(calledJobIds).not.toContain("content-factory");
+    const missionFlows = listTaskFlowRecords().filter(
+      (record) => record.controllerId === "mission-runtime",
+    );
+    expect(
+      missionFlows.some((record) => record.ownerKey.includes("suppressed:content-factory")),
+    ).toBe(true);
+    expect(
+      state.store?.jobs.find((job) => job.id === "target-enrichment")?.state.lastRunStatus,
+    ).toBe("ok");
+    expect(state.store?.jobs.find((job) => job.id === "content-factory")?.state.nextRunAtMs).toBe(
+      nowMs + 60_000,
+    );
+  });
+
   it("re-arms timer without hot-looping when a run is already in progress", async () => {
     const timeoutSpy = vi.spyOn(globalThis, "setTimeout");
     const store = timerRegressionFixtures.makeStorePath();
